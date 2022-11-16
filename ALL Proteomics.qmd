@@ -1,0 +1,15 @@
+---
+title: "ALL Proteomics"
+author: "Sebastian Wolf"
+toc: true
+format:
+  html:
+    theme: litera
+    self-contained: true
+    code-fold: true
+knitr:
+  opts_chunk:
+    message: false
+    warning: false
+bibliography: references.bib
+---
