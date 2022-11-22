@@ -13,3 +13,28 @@ knitr:
     warning: false
 bibliography: references.bib
 ---
+
+```{r}
+library(tidyverse)
+```
+
+# Introduction
+
+# Data Carpentry and Metadata
+
+We first investigate the available metadata to get an feeling for the overall sample composition and quality.
+
+```{r}
+meta.all_study_list <- readxl::read_excel("Data/Metadata/ALLStudy1_Liste_total.xlsx", sheet = "final", skip = 3) %>% 
+  tibble::repair_names() -> meta.all_study_list
+
+meta.all_study_list %>% glimpse()
+
+meta.all_study_list %>% 
+  dplyr::select(Subtyp, LaufNr, viability, `alive cells...13`, `BLASTS 08.04.`, `NEW CD19+`, `conc [µg/mL]`) %>% 
+  dplyr::rename("ID" = "LaufNr",
+                "total_cells_alive" = "alive cells...13",
+                "blast_percentage" = "BLASTS 08.04",
+                "cd19_percentage")
+
+```
