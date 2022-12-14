@@ -11,7 +11,6 @@ knitr:
   opts_chunk:
     message: false
     warning: false
-bibliography: references.bib
 ---
 
 ```{r}
@@ -22,19 +21,640 @@ library(tidyverse)
 
 # Data Carpentry and Metadata
 
-We first investigate the available metadata to get an feeling for the overall sample composition and quality.
+The pilot data set includes samples of bcr-abl negative (ph-) precursor B-ALL. During thawing and sample preparations, cellular sample composition was also assessed by flow cytometry. Blast cells were defined in the CD45/SSC-Plot as being CD45dimSSClow ("blast gate") . Additionally, a sub-gate of CD19+ events was defined to identify CD19+ blasts. Blasts frequency and CD19+ blast frequency are stored in the "08_04" columns.
 
 ```{r}
 meta.all_study_list <- readxl::read_excel("Data/Metadata/ALLStudy1_Liste_total.xlsx", sheet = "final", skip = 3) %>% 
-  tibble::repair_names() -> meta.all_study_list
+  janitor::clean_names() -> meta.all_study_list
 
 meta.all_study_list %>% glimpse()
 
 meta.all_study_list %>% 
-  dplyr::select(Subtyp, LaufNr, viability, `alive cells...13`, `BLASTS 08.04.`, `NEW CD19+`, `conc [µg/mL]`) %>% 
-  dplyr::rename("ID" = "LaufNr",
-                "total_cells_alive" = "alive cells...13",
-                "blast_percentage" = "BLASTS 08.04",
-                "cd19_percentage")
+  dplyr::select(subtyp, lauf_nr, datum_7, total_cells_9, alive_cells_10, viability, total_cells_12, alive_cells_13, blasts_08_04, cd19_08_04, conc_mg_m_l) %>% 
+  dplyr::rename("ID" = "lauf_nr",
+                "thawing_date" = "datum_7",
+                "cells_per_ml" = "total_cells_9",
+                "alive_cells_per_ml" = "alive_cells_10",
+                "cells_total" = "total_cells_12",
+                "alive_cells_total" = "alive_cells_13",
+                "cd45_blasts" = "blasts_08_04",
+                "cd19_blasts" = "cd19_08_04",
+                "protein_conc_mu_per_ml" = "conc_mg_m_l") %>% 
+  mutate(subtyp = factor(subtyp)) -> meta.all
 
+```
+
+## Metadata summary
+
+```{r}
+table(meta.all$subtyp, useNA = "always")
+```
+
+```{r}
+#| label: "quality plots"
+#| fig-cap: "Quality control plots"
+#| fig-subcap: 
+#| - "Total cells per ml"
+#| - "Alive cells per ml"
+#| - "CD45 blasts percentage"
+#| - "CD19 blasts percentage"
+#| layout-ncol: 3
+#| layout-nrow: 2
+
+meta.all %>% 
+  ggplot(aes(x=cells_per_ml)) +
+  geom_histogram(bins = 30) +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  labs(title = "cells/ml", x = "cells/ml") 
+
+meta.all %>% 
+  ggplot(aes(x=alive_cells_per_ml)) +
+  geom_histogram() +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  labs(title = "alive cells/ml")
+
+
+meta.all %>% 
+  ggplot(aes(x=cd45_blasts)) +
+  geom_histogram() +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  labs(title = "CD45 blast percentage")
+
+
+meta.all %>% 
+  ggplot(aes(x=cd19_blasts)) +
+  geom_histogram() +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  labs(title = "CD19 blast percentage")
+
+meta.all %>% 
+  ggplot(aes(x=viability)) +
+  geom_histogram() +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  labs(title = "Viability percentage")
+```
+
+Summary statistics for sample composition.
+
+```{r}
+meta.all %>% 
+  dplyr::select(cells_per_ml, alive_cells_per_ml, cd45_blasts, cd19_blasts, viability) %>% 
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>% 
+  group_by(variable) %>% 
+  summarize(summary(value) %>% broom::tidy())
+```
+
+```{r}
+#| label: "correlationplot"
+#| fig-cap: "Correlationplot of sample variables"
+
+
+meta.all %>% 
+  dplyr::select(cells_per_ml, alive_cells_per_ml, cd45_blasts, cd19_blasts, viability, protein_conc_mu_per_ml) %>% 
+  as.matrix() %>% 
+  cor(method = "spearman") %>% 
+  corrplot::corrplot(addCoef.col = "black")
+```
+
+Notably, there's a moderate negative correlation between total number of cells and viability (-.3) and the total number of cells and CD19 blasts. On the other hand, there's a positive correlation between alive cells and total cells per ml. This suggests that samples with high cell counts are mainly enriched for non leukemic blast cells and that many of these cells are in fact dead. Furthermore, there's only a weak positive correlation between CD45 and CD19 blast counts which could imply that either CD19 is not specific for leukemic sub-clones or that gating on CD45 alone was (in this case) not sensitive enough.
+
+Some samples show very low viability and/or very low blast counts. We can visualize the quality control (QC) measurements and count the fraction of samples that don't pass manually defined QCs (less than 5 mio total cells, less than 1 mio alive cells, viability below 30%, less than 70% CD45 blasts, less than 50% CD19 blasts).
+
+```{r}
+#| label: "sample_qc"
+#| fig-cap: "Sample QC plot"
+
+
+meta.all %>% 
+  dplyr::select(ID, cells_per_ml, alive_cells_per_ml, cd45_blasts, viability) %>% 
+  pivot_longer(cols = -ID, names_to = "variable", values_to = "value") %>% 
+  mutate(variable = as.factor(variable)) %>%
+  mutate(pass = case_when(variable == "cells_per_ml" & value <= 5e+6 ~ F,
+                          variable == "alive_cells_per_ml" & value <= 1e+6 ~ F,
+                          variable == "viability" & value <= 0.3 ~ F,
+                          variable == "cd45_blasts" & value <= 0.7 ~ F,
+                          #variable == "cd19_blasts" & value <= 0.5 ~ F,
+                          TRUE ~ T)) %>% 
+  group_by(variable) %>% 
+  summarize(pass = sum(pass)/n(), non_pass = 1- pass) %>% 
+  pivot_longer(cols = -variable, names_to = "pass", values_to = "dec") %>% 
+  ggplot(aes(x=variable, y = dec, fill = pass)) +
+  geom_col() +
+  scale_fill_manual(aesthetics = "fill", values = c("pass" = "lightgreen", "non_pass" = "red")) +
+  cowplot::theme_cowplot() +
+  labs(title = "Sample QC", x = "", y = "Fraction", caption = "red = not passed") +
+  theme(legend.position = "none")
+  
+  
+```
+
+```{r}
+meta.all %>% 
+  dplyr::select(ID, cells_per_ml, alive_cells_per_ml, cd45_blasts, viability) %>% 
+  pivot_longer(cols = -ID, names_to = "variable", values_to = "value") %>% 
+  mutate(variable = as.factor(variable)) %>%
+  mutate(pass = case_when(variable == "cells_per_ml" & value <= 5e+6 ~ F,
+                          variable == "alive_cells_per_ml" & value <= 1e+6 ~ F,
+                          variable == "viability" & value <= 0.3 ~ F,
+                          variable == "cd45_blasts" & value <= 0.7 ~ F,
+                          #variable == "cd19_blasts" & value <= 0.5 ~ F,
+                          TRUE ~ T)) %>% 
+  group_by(ID) %>% 
+  summarize(pass = sum(pass)) -> id_wise_qc
+
+table(id_wise_qc$pass)
+```
+
+Notably, only 50 samples pass all 4 QCs. Requiring at least 2 of the 4 QC criteria would remove 23 samples.
+
+```{r}
+meta.all %>% 
+  dplyr::select(ID, cells_per_ml, alive_cells_per_ml, cd45_blasts, viability) %>% 
+  pivot_longer(cols = -ID, names_to = "variable", values_to = "value") %>% 
+  mutate(variable = as.factor(variable)) %>%
+  mutate(pass = case_when(variable == "cells_per_ml" & value <= 5e+6 ~ F,
+                          variable == "alive_cells_per_ml" & value <= 1e+6 ~ F,
+                          variable == "viability" & value <= 0.3 ~ F,
+                          variable == "cd45_blasts" & value <= 0.7 ~ F,
+                          #variable == "cd19_blasts" & value <= 0.5 ~ F,
+                          TRUE ~ T)) %>% 
+  group_by(ID) %>% 
+  summarize(pass = sum(pass)) %>% 
+  filter(pass <= 2) %>% 
+  left_join(meta.all, by=c("ID")) -> low_qc_sampels
+
+low_qc_sampels %>% 
+  DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+Reasons for QC failure are
+
+```{r}
+low_qc_sampels %>% 
+  dplyr::select(ID, cells_per_ml, alive_cells_per_ml, cd45_blasts, viability) %>% 
+  pivot_longer(cols = -ID, names_to = "variable", values_to = "value") %>% 
+  mutate(variable = as.factor(variable)) %>%
+  mutate(pass_reason = case_when(variable == "cells_per_ml" & value <= 5e+6 ~ "low_cellcount",
+                          variable == "alive_cells_per_ml" & value <= 1e+6 ~ "low_alive_cellcount",
+                          variable == "viability" & value <= 0.3 ~ "low_viability",
+                          variable == "cd45_blasts" & value <= 0.7 ~ "low_blastcount"))  %>% 
+  {
+    table(.$pass_reason)
+  }
+```
+
+Most of these samples fail QC due to low viability (\< 30%).
+
+We remove all 13 samples with the lowest viability (\<15%). This leaves us with 97 samples.
+
+```{r}
+meta.all %>% 
+  left_join(id_wise_qc) %>% 
+  filter(viability > 0.15) -> meta.all
+```
+
+This still leaves 7 samples that violate 3 of the 4 QC criteria.
+
+```{r}
+meta.all %>% 
+  filter(pass == 1) %>% 
+  DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+## Proteomics data
+
+After we have investigated and characterized the sample metadata, we load, clean, normalize and transform the proteomic data.
+
+```{r}
+prot.all <- read_tsv("Data/Proteomics/Cremer_ALL.txt") %>% 
+  janitor::clean_names()
+
+dim(prot.all)
+
+```
+
+The data set includes TMT quantification data for 6844 features over 328 columns. Every sample is measured twice spread over several plexes. We first subset the data set to only contain uniprot IDs for protein identification and the corrected reporter intensities.
+
+```{r}
+
+prot.all %>% 
+  dplyr::select(uniprot_i_ds : reporter_intensity_corrected_9_r2_695) %>% 
+  dplyr::rename("uniprotid" = "uniprot_i_ds") %>% 
+  dplyr::rename_with(.cols = -uniprotid, .fn = ~ stringr::str_remove(string = ., "reporter_intensity_corrected_")) -> prot.all
+```
+
+We first filter for features with only NAs
+
+```{r}
+is.nan(as.matrix(prot.all[, !colnames(prot.all) %in% c("uniprotid", "gene_names")])) -> all_nan
+
+prot.all[, !colnames(prot.all) %in% c("uniprotid", "gene_names")][all_nan] <- NA_integer_
+
+
+```
+
+The feature identifiers are either uniprotids or HUGO gene symbols. However, gene symbols are non-unique and uniprotids are concatenated.
+
+```{r}
+duplicated(prot.all$gene_names) %>% sum()
+duplicated(prot.all$uniprotid) %>% sum()
+
+prot.all$uniprotid %>% sample(size = 20)
+```
+
+```{r}
+bind_cols(prot.all, "uniprotid_cor" = stringr::str_split(prot.all$uniprotid, pattern = ";") %>% purrr::map_chr(~ .[[1]])) -> prot.all
+
+prot.all %>% 
+  dplyr::select(uniprotid, uniprotid_cor, gene_names) -> prot.id_vector.all
+
+prot.all %>% 
+  dplyr::select(-uniprotid, -gene_names) %>% 
+  column_to_rownames("uniprotid_cor") -> prot.all
+```
+
+All samples were measured in technical duplicates (R1, R2).
+
+```{r}
+tibble("sample" = colnames(prot.all)) %>% 
+  mutate(plex = as.numeric(stringr::str_extract(string = sample, pattern = "6\\d{2}")),
+         replicate = factor(stringr::str_detect(string = sample, pattern = "_r1_"), levels=c(T,F), labels=c("R1","R2"))) %>% 
+  {
+    table(.$plex, .$replicate)
+  }
+```
+
+Notably, **plex 640 was only measured in R1** (and plex 647 , most likely the last plex that was loaded, only contained 6 samples instead of 9 in both replicates).
+
+```{r}
+#| label: "replicate batch"
+#| fig-cap: "Technical replicate batch"
+#| fig-subcap: 
+#| - "Intensities per replicate"
+#| - "Intensities per replicate"
+
+
+prot.all %>% 
+  as_tibble(rownames = "uniprotid") %>% 
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensity") %>% 
+  mutate(replicate = factor(stringr::str_detect(string = sample, pattern = "_r1_"), levels=c(T,F), labels=c("R1","R2"))) %>% 
+  ggplot(aes(x=replicate, y = intensity, fill = replicate)) + 
+  geom_violin() +
+  cowplot::theme_cowplot() +
+  scale_y_log10() +
+  theme(legend.position = "none")
+
+prot.all %>% 
+  as_tibble(rownames = "uniprotid") %>% 
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensity") %>% 
+  mutate(replicate = factor(stringr::str_detect(string = sample, pattern = "_r1_"), levels=c(T,F), labels=c("R1","R2"))) %>% 
+  ggplot(aes(x=log(intensity), fill = replicate)) + 
+  geom_density(alpha = 0.3) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none")
+```
+
+```{r}
+#| label: "Replicate-wise PCA plot"
+#| fig-cap: "Replicate-wise PCA plot"
+
+
+prot.all %>% 
+  t() %>% 
+  pcaMethods::pca() %>% 
+  pcaMethods::scores() %>% 
+  as_tibble(rownames = "sample") %>% 
+  mutate(plex = as.numeric(stringr::str_extract(string = sample, pattern = "6\\d{2}")),
+         replicate = factor(stringr::str_detect(string = sample, pattern = "_r1_"), levels=c(T,F), labels=c("R1","R2"))) %>%
+  ggplot(aes(x=PC1, y = PC2, col = factor(plex))) +
+  geom_point(size = 2)
+
+```
+
+From the plots it seems that most of the technical replicates have high similarity (note, plex 640 is removed).
+
+```{r}
+cor(prot.all[, grepl(colnames(prot.all), pattern = "_r1_") & !grepl("640", colnames(prot.all))], prot.all[, grepl(colnames(prot.all), pattern = "_r2_")], use = "complete.obs") %>% 
+  ComplexHeatmap::Heatmap(cluster_columns = F, 
+                          cluster_rows = F, 
+                          show_row_names = F, 
+                          show_column_names = F, 
+                          column_title = "Replicate 1", 
+                          row_title = "Replicate 2")
+```
+
+Clearly, there are samples that are very different from the majority.
+
+Furthermore, samples were measured in 10 plex
+
+```{r}
+#| label: "boxplots by plex"
+#| fig-cap: "Sample-wise intensities by plex"
+
+
+prot.all %>% 
+  #head() %>% 
+  pivot_longer(cols = everything(), names_to = "sample", values_to = "intensity") %>% 
+  mutate(plex = as.numeric(stringr::str_extract(string = sample, pattern = "6\\d{2}")),
+         replicate = factor(stringr::str_detect(string = sample, pattern = "_r1_"), levels=c(T,F), labels=c("R1","R2"))) %>% 
+  ggplot(aes(x=fct_reorder(sample, plex), y = log(intensity), fill = factor(plex))) +
+  geom_boxplot(outlier.shape = NA) +
+  theme(axis.text.x = element_blank()) +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  labs(x="", y = "log(intensity)")
+```
+
+There's considerable within- and between-plex batching that needs to be corrected.
+
+We can calculate raw inner- and inter-plex correlation. The inner-plex correlation is calculated by constructing a plex-wise correlation matrix and taking the mean correlation coefficient.
+
+The inter-plex correlation coefficient on the other hand is created by constructing an sample x plex expression matrix (i.e. samples 1 through 10 for plexes 639 through 695) for every single protein, calculating the spearman correlation matrix and aggregating the mean. This gives a mean correlation coefficient for every protein.
+
+```{r}
+#| label: "inner_plex_correlation"
+#| fig-cap: "Inner plex correlation"
+
+
+prot.all %>% 
+  #head() %>% 
+  as_tibble(rownames = "uniprotid") %>% 
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>% 
+  mutate(plex = as.numeric(stringr::str_extract(string = sample, pattern = "6\\d{2}"))) %>% 
+  nest_by(plex) %>% 
+  {
+    split(.$data, .$plex)
+  } %>% 
+  purrr::map_df(~ pivot_wider(.[[1]], id_cols = uniprotid, names_from = sample, values_from = intensities) %>%
+               column_to_rownames("uniprotid") %>% 
+               cor(use = "pairwise.complete.obs", method = "spearman") %>% mean()) %>% 
+  pivot_longer(cols = everything(), names_to = "plex", values_to = "spearmans_r") %>% 
+  mutate(plex = factor(plex)) %>% 
+  ggplot(aes(x=fct_reorder(plex, spearmans_r), y = spearmans_r)) +
+  geom_col() +
+  cowplot::theme_cowplot() +
+  labs(x = "", y = "Spearmans rho", title = "Inner-plex correlation") -> inner_plex_cor
+
+```
+
+```{r}
+#| eval: false
+
+# the calculation takes quite some time, hence for rendering we save the matrix in an RDS object
+prot.all %>% 
+  head() %>% 
+  as_tibble(rownames = "uniprotid") %>% 
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>% 
+  mutate(plex = as.numeric(stringr::str_extract(string = sample, pattern = "6\\d{2}"))) %>% 
+  nest_by(uniprotid) %>% 
+  {
+    split(.$data, .$uniprotid)
+  } %>% 
+  purrr::map_df(~ mutate(.[[1]], sample = stringr::str_extract(sample, pattern = "\\d{1}")) %>%
+               group_by(sample, plex) %>% 
+               summarize(intensities = median(intensities, na.rm = T)) %>% 
+               pivot_wider(id_cols = sample, names_from = plex, values_from = intensities) %>%
+               column_to_rownames("sample") %>% 
+               cor(method = "spearman", use = "pairwise.complete.obs") %>% 
+                 mean()) %>% 
+  pivot_longer(cols = everything(), names_to = "uniprotid", values_to = "spearman_rho") -> inter_plex_sample_cor
+
+saveRDS(inter_plex_sample_cor, "inter_plex_sample_cor.RDS")
+  
+```
+
+```{r}
+#| label: "inter_plex_correlation"
+#| fig-cap: "Inter plex correlation"
+
+
+inter_plex_sample_cor <- readRDS("inter_plex_sample_cor.RDS")
+
+
+inter_plex_sample_cor %>% 
+  ggplot(aes(x=factor("This study"), y = spearman_rho)) +
+  geom_violin(fill = "#e76f51") +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none") +
+  labs(title = "Inter-plex correlation",  x = "", y = "Spearmans rho") -> inter_plex_cor
+```
+
+The reference channel chosen for normalization was #9. We can compare the general inter-plex spearman correlation for this reference channel.
+
+```{r}
+prot.all[, stringr::str_starts(string = colnames(prot.all), "9_")] %>% 
+  as_tibble(rownames = "uniprotid") %>% 
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>% 
+  mutate(replicate = factor(stringr::str_detect(string = sample, pattern = "_r1_"), levels=c(T,F), labels=c("R1","R2"
+                                                                                                            )
+                            )
+         ,
+         sample = stringr::str_remove_all(string = sample, pattern = "_r[1,2]")) %>% 
+  group_by(sample, uniprotid) %>% 
+  summarize(intensities = mean(intensities, na.rm = T)) %>% 
+  pivot_wider(id_cols = uniprotid, names_from = sample, values_from = intensities) %>% 
+  column_to_rownames("uniprotid") %>% 
+  cor(method = "spearman", use = "pairwise.complete.obs") %>% 
+  as_tibble(rownames = "sample_com") %>% 
+  pivot_longer(cols = -sample_com, names_to = "sample", values_to = "spearman_rho") %>% 
+  filter(sample_com != sample) %>% 
+  ggplot(aes(x=factor("This study"), y = spearman_rho)) +
+  geom_violin(fill = "#e76f51") +
+  cowplot::theme_cowplot() +
+  labs(x = "", y = "Spearmans rho") -> ref_channel_inter_plex_cor
+```
+
+```{r}
+#| label: plex_comparisons
+#| fig-cap: "Inner-, inter- and reference channel plex comparison"
+#| fig-subcap: 
+#| - "Inner-plex correlation"
+#| - "Inter-plex correlation"
+#| - "Reference channel inter-plex correlation"
+#| layout-ncol: 2
+
+inner_plex_cor
+inter_plex_cor
+ref_channel_inter_plex_cor
+
+```
+
+### Normalization
+
+#### Sample-loading normalization
+
+First, we normalize each plex to equal loadings. First, we calculate the mean of the column sums as the target size factor and apply the correction to every column and confirm that all columns have equal sum-intensities after correction.
+
+```{r}
+
+prot.all %>% colSums(na.rm = T) %>% mean() -> target_size_factor
+
+target_size_factor/colSums(prot.all, na.rm = T) -> normalization_factor
+ -
+assign("prot.all.slc", sweep(prot.all, MARGIN = 2, STATS = normalization_factor, FUN = "*")) #interestingly when using the <- assign operator, the entire matrix is with sign negative...
+
+prot.all.slc %>% colSums(na.rm = T) %>% all()
+
+```
+
+We can investigate the effect of the sample loading correction
+
+```{r}
+#| label: post_slc
+#| fig-cap: "Effects of sample loading correation on sample-wise intensities"
+#| fig-subcap: 
+#| - "Sample-wise intensities"
+#| - "Sample-wise densities"
+
+
+prot.all.slc %>% 
+  pivot_longer(cols = everything(), names_to = "sample", values_to ="intensities") %>% 
+  mutate(plex = factor(stringr::str_extract(string = sample, pattern = "r[1,2]_6\\d{2}"))) %>% 
+  ggplot(aes(x=sample, y = log(intensities), fill = factor(plex))) +
+  geom_boxplot(outlier.shape = NA) +
+  cowplot::theme_cowplot() +
+  scale_fill_viridis_d(name = "Plex") +
+  theme(axis.text.x = element_blank())
+
+prot.all.slc %>% 
+  pivot_longer(cols = everything(), names_to = "sample", values_to ="intensities") %>% 
+  mutate(plex = factor(stringr::str_extract(string = sample, pattern = "r[1,2]_6\\d{2}"))) %>% 
+  ggplot(aes(x= log(intensities), col = factor(plex))) +
+  geom_density() +
+  cowplot::theme_cowplot() +
+  scale_color_viridis_d(name = "Plex")
+```
+
+#### Internal reference standard (IRS) normalization
+
+Lastly, we can apply the internal reference scaling to normalize intensities within plexes. The internal reference standard was measured in channel #9 of each plex. We calculate a protein-wise normalization factor based on the averaged intensities over all reference channels divided by the plex-wise intensity. Then we apply a plex- and protein-wise normalization. Finally, the technical replicates are merged by mean intensities.
+
+```{r}
+# we calculate for every protein the average intensity over all reference channels (#9 in our experiment) which gives a protein-wise target intensity. In the original manuscript, this is done in the log space so we keep with this 
+
+prot.all.slc %>% 
+  #head() %>% 
+  dplyr::select(contains("9_")) %>%
+  as.matrix() %>%  
+  matrixStats::rowMeans2(na.rm = T) -> irs_target_intensities
+
+# we then use the target intensities and calculate a protein-wise scaling factor (target intensits/measured intensity) for every plex' reference channel. This gives a scaling factor for every protein in every plex. Note, that R performs column-wise division. Note furthermore, that proteins are always missing in the entire plex.
+
+
+irs_target_intensities/prot.all.slc[, grepl(pattern = "9_", x = colnames(prot.all.slc))] %>%
+  setNames(stringr::str_remove(string = colnames(.), pattern = "9_")) -> irs_correction_matrix
+
+# now we apply the plex' wise transformation. For this, we first nest and list-split every plex-wise subset, re-create a wide format df with proteins x samples and multiply every element with the plex-and protein-wise scaling factor. We use apply inside the pipe with MARGIN = 2 for the column-wise operation. Additionally, by using imap, we can reference not only the subset data frame (.x) but also the element-name (.y) which equals the scaling factor column in the correction matrix
+
+prot.all.slc %>%
+  #head() %>%
+  as_tibble(rownames = "uniprotid") %>%
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>%
+  mutate(plex = stringr::str_extract(string = sample, pattern = "r[1,2]_6\\d{2}")) %>%
+  nest_by(plex) %>%
+  {
+    split(.$data, .$plex)
+  } %>%
+  purrr::imap_dfc(~ pivot_wider(.x[[1]], id_cols = uniprotid, names_from = sample, values_from = intensities) %>%
+               column_to_rownames("uniprotid") %>%
+                apply(MARGIN = 2,
+                  FUN = function(n) irs_correction_matrix[, grepl(x = colnames(irs_correction_matrix),pattern =  .y[[1]])]*n) %>% bind_cols()) -> prot.all.slc.irs
+
+```
+
+```{r}
+prot.all.slc.irs %>% dplyr::select(contains("r1")) %>% log2() %>% boxplot()
+```
+
+```{r}
+
+prot.all.slc.irs %>% 
+  #head() %>% 
+  as_tibble() %>% 
+  dplyr::bind_cols("uniprotid" = rownames(prot.all)) %>% 
+  #head() %>% 
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>% 
+  mutate(sample_id = stringr::str_extract(string = sample, pattern = "\\d{1}"),
+         plex = stringr::str_extract(string = sample, pattern = "6\\d{2}"),
+         sample_fin = paste(sample_id, plex, sep = "_")) %>% 
+  group_by(sample_fin, uniprotid) %>% 
+  summarize(intensities = mean(intensities, na.rm = T)) %>% 
+  pivot_wider(id_cols = uniprotid, names_from = sample_fin, values_from = intensities) %>% 
+  column_to_rownames("uniprotid") -> prot.all.slc.irs.merge
+
+prot.all.slc.irs.merge[is.nan(as.matrix(prot.all.slc.irs.merge))] <- NA_integer_
+  
+```
+
+We plot some QC metrics to confirm the effect of the sample-loading and internal reference standard-correction as well as the log-transformation.
+
+```{r}
+#| label: post_normalization_figures
+#| fig-cap: "Post normalization QC plots"
+#| fig-subcap: 
+#| - "Post SLC sample-wise boxplots"
+#| - "Post SLC sample-wise densitiy plots"
+#| - "Post IRS + SLC sample-wise boxplots"
+#| - "Post IRS + SLC sample-wise density plots"
+
+
+prot.all.slc %>% log() %>%
+  as_tibble(rownames = "uniprotid") %>% 
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>%
+  mutate(sample_id = stringr::str_extract(string = sample, pattern = "\\d{1}"),
+         plex = stringr::str_extract(string = sample, pattern = "6\\d{2}"),
+         sample_fin = paste(sample_id, plex, sep = "_")) %>% 
+  group_by(sample_fin, uniprotid) %>% 
+  summarize(intensities = mean(intensities, na.rm = T)) -> prot.all.slc.merge
+
+
+prot.all.slc.merge %>% 
+  mutate(plex = as.numeric(stringr::str_extract(string = sample_fin, pattern = "6\\d{2}"))) %>% 
+  ggplot(aes(x=fct_reorder(sample_fin, plex), y = intensities, fill = as.factor(plex))) +
+  geom_boxplot(outlier.shape = NA) +
+  theme(legend.position = "none", 
+        axis.text.x = element_blank()) +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  labs(x="", y = "log2 intensities") +
+  scale_fill_viridis_d(name = "plex") -> boxplot.slc
+
+
+
+prot.all.slc.merge %>% 
+  ggplot(aes(x=intensities, col = sample_fin)) +
+  geom_density() +
+  theme(legend.position = "none") +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  labs(x="", y = "log2 intensities")
+
+
+prot.all.slc.irs.merge %>% 
+  pivot_longer(cols = everything(), names_to = "sample_fin", values_to = "intensities") %>% 
+  mutate(plex = as.numeric(stringr::str_extract(string = sample_fin, pattern = "6\\d{2}"))) %>% 
+  ggplot(aes(x=fct_reorder(sample_fin, plex), y = intensities, fill = as.factor(plex))) +
+  geom_boxplot(outlier.shape = NA) +
+  theme(legend.position = "none", 
+        axis.text.x = element_blank()) +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  labs(x="", y = "log2 intensities") +
+  scale_fill_viridis_d(name = "plex") -> boxplot.irs.slc
+
+
+
+prot.all.slc.irs.merge %>% 
+  #log() %>% 
+  pivot_longer(cols = everything(), names_to = "sample", values_to = "intensities") %>% 
+  ggplot(aes(x=intensities, col = sample)) +
+  geom_density() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  theme(legend.position = "none") 
 ```
