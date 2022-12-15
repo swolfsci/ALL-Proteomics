@@ -432,6 +432,7 @@ saveRDS(inter_plex_sample_cor, "inter_plex_sample_cor.RDS")
 ```
 
 ```{r}
+#| eval: false
 #| label: "inter_plex_correlation"
 #| fig-cap: "Inter plex correlation"
 
@@ -482,7 +483,7 @@ prot.all[, stringr::str_starts(string = colnames(prot.all), "9_")] %>%
 #| layout-ncol: 2
 
 inner_plex_cor
-inter_plex_cor
+#inter_plex_cor
 ref_channel_inter_plex_cor
 
 ```
@@ -552,9 +553,9 @@ prot.all.slc.merge %>%
 ```
 
 ```{r}
-prot.all.slc[, grepl(pattern = "uniprotid", colnames(prot.all.slc.merge))] %>% 
-  log2() %>% 
+prot.all.slc.merge %>% 
   dplyr::select(contains("8_")) %>% 
+  log2() %>% 
   psych::pairs.panels()
 ```
 
@@ -632,8 +633,10 @@ We plot some QC metrics to confirm the effect of the sample-loading and internal
 
 
 prot.all.slc.merge %>% 
-  mutate(plex = as.numeric(stringr::str_extract(string = sample_fin, pattern = "6\\d{2}"))) %>% 
-  ggplot(aes(x=fct_reorder(sample_fin, plex), y = intensities, fill = as.factor(plex))) +
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>% 
+  mutate(plex = as.numeric(stringr::str_extract(string = sample, pattern = "6\\d{2}")),
+         intensities = log2(intensities)) %>% 
+  ggplot(aes(x=fct_reorder(sample, plex), y = intensities, fill = as.factor(plex))) +
   geom_boxplot(outlier.shape = NA) +
   theme(legend.position = "none", 
         axis.text.x = element_blank()) +
@@ -645,12 +648,15 @@ prot.all.slc.merge %>%
 
 
 prot.all.slc.merge %>% 
-  ggplot(aes(x=intensities, col = sample_fin)) +
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>% 
+  mutate(plex = as.numeric(stringr::str_extract(string = sample, pattern = "6\\d{2}")),
+         intensities = log2(intensities)) %>%
+  ggplot(aes(x=intensities, col = sample)) +
   geom_density() +
-  theme(legend.position = "none") +
   cowplot::theme_minimal_grid()+
   cowplot::panel_border() +
-  labs(x="", y = "log2 intensities")
+  labs(x="", y = "log2 intensities") +
+  theme(legend.position = "none") 
 
 
 prot.all.slc.irs.merge %>% 
@@ -881,7 +887,7 @@ prot.all.slc.irs.merge.filtered %>%
   pcaMethods::scores() %>% 
   as_tibble(rownames = "sample") %>%
   mutate(plex = stringr::str_extract(string = sample, pattern = "6\\d{2}")) %>% 
-  left_join(prot.all.slc.irs.merge.missingness_by_plex, by="plex") %>% 
+  left_join(prot.all.slc.irs.merge.filtered.missingness_by_plex, by="plex") %>% 
   dplyr::rename("no_missingnes" = "value") %>% 
   ggplot(aes(x=PC1, y = PC2, col = no_missingnes)) +
   geom_point() +
@@ -900,7 +906,7 @@ prot.all.slc.irs.merge.filtered %>%
   pcaMethods::scores() %>% 
   as_tibble(rownames = "sample") %>%
   mutate(plex = stringr::str_extract(string = sample, pattern = "6\\d{2}")) %>% 
-  left_join(prot.all.slc.irs.merge.missingness_by_plex, by="plex") %>% 
+  left_join(prot.all.slc.irs.merge.filtered.missingness_by_plex, by="plex") %>% 
   dplyr::rename("no_missingnes" = "value") %>% 
   dplyr::select(-sample) %>% 
   rstatix::cor_test(vars = no_missingnes, method = "spearman") %>% 
@@ -929,6 +935,8 @@ meta.all %>%
 meta.all %>% 
   filter(is.na(prot_id))
 
+
+
 ```
 
 Two samples, 11103 and 26511 are not re-identified in the data set.
@@ -947,7 +955,7 @@ tibble(sample = colnames(prot.all.slc.irs.merge.filtered)) %>%
 prot.all.slc.irs.merge.filtered[, !colnames(prot.all.slc.irs.merge.filtered) %in% low_viability_samples] -> prot.all.slc.irs.merge.filtered
 ```
 
-This leaves a final data set with a dimensionality of `dim(prot.all.slc.irs.merge.filtered)`
+This leaves a final data set with a dimensionality of `r dim(prot.all.slc.irs.merge.filtered)`
 
 ```{r}
 prot.all.slc.irs.merge.filtered %>% 
@@ -981,14 +989,48 @@ And filter this matrix for statistically significant correlations (FDR \<5%)
 ```{r}
 prot.all.slc.irs.merge.filtered.10PCs %>% 
   left_join(meta.all, by=c("sample" = "prot_id")) %>% 
-  rstatix::cor_test(vars = c(PC1:PC10), vars2=c(cells_per_ml:protein_conc_mu_per_ml), method = "spearman") %>% 
+  rstatix::cor_test(vars = c(PC1:PC10), vars2=c(cells_per_ml:pass), method = "spearman") %>% 
   rstatix::adjust_pvalue() %>% 
   rstatix::add_significance() %>% 
   arrange(desc(-log(p.adj))) %>% 
-  filter(p.adj.signif != "ns")
+  filter(p.adj.signif != "ns") %>% 
+  DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
 ```
 
-This shows that the 1st PC is strongly correlated with viability and, to a lesser extent, the amount of CD19+ blasts. PC3 is moderately correlated with cellular content and protein concentration as is PC4.
+This shows that the 1st PC is strongly correlated with viability and, to a lesser extent, the amount of CD19+ blasts. PC3 is moderately correlated with cellular content, protein concentration and the integrated QC metric "pass".
+
+```{r}
+#| label: PC1_scores
+#| fig-cap: "PC1 vs sample features"
+#| fig-subcap: 
+#| - "PC1 vs viability"
+#| - "PC1 vs CD19+ blasts"
+#| layout-ncol: 2
+
+
+prot.all.slc.irs.merge.filtered.10PCs %>% 
+  left_join(meta.all, by=c("sample" = "prot_id")) %>% 
+  ggplot(aes(x=PC1, y = viability, col = viability)) +
+  geom_point(size = 2) +
+  scale_color_viridis_c() +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  labs(x="PC1 scores",  y = "Viability") +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(method = "spearman")
+
+prot.all.slc.irs.merge.filtered.10PCs %>% 
+  left_join(meta.all, by=c("sample" = "prot_id")) %>% 
+  ggplot(aes(x=PC1, y = cd19_blasts, col = viability)) +
+  geom_point(size = 2) +
+  scale_color_viridis_c() +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  labs(x="PC1 scores",  y = "Viability") +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(method = "spearman")
+```
+
 
 ```{r}
 prot.all.slc.irs.merge.filtered %>% 
@@ -1011,25 +1053,32 @@ From visual inspections, there might be a slight bias in the samples thawed at 2
 
 ```{r}
 meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(viability ~ thawing_date, ref.group = "2022-01-20")
+  rstatix::pairwise_wilcox_test(viability ~ thawing_date, ref.group = "2022-01-20") %>% 
+  filter(p.adj.signif != "ns")
 
 meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(cells_per_ml ~ thawing_date, ref.group = "2022-01-20")
+  rstatix::pairwise_wilcox_test(cells_per_ml ~ thawing_date, ref.group = "2022-01-20") %>% 
+  filter(p.adj.signif != "ns")
 
 meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(alive_cells_per_ml ~ thawing_date, ref.group = "2022-01-20")
+  rstatix::pairwise_wilcox_test(alive_cells_per_ml ~ thawing_date, ref.group = "2022-01-20") %>% 
+  filter(p.adj.signif != "ns")
 
 meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(cells_total ~ thawing_date, ref.group = "2022-01-20")
+  rstatix::pairwise_wilcox_test(cells_total ~ thawing_date, ref.group = "2022-01-20") %>% 
+  filter(p.adj.signif != "ns")
 
 meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(alive_cells_total ~ thawing_date, ref.group = "2022-01-20")
+  rstatix::pairwise_wilcox_test(alive_cells_total ~ thawing_date, ref.group = "2022-01-20") %>% 
+  filter(p.adj.signif != "ns")
 
 meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(cd45_blasts ~ thawing_date, ref.group = "2022-01-20")
+  rstatix::pairwise_wilcox_test(cd45_blasts ~ thawing_date, ref.group = "2022-01-20") %>% 
+  filter(p.adj.signif != "ns")
 
 meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(cd19_blasts ~ thawing_date, ref.group = "2022-01-20")
+  rstatix::pairwise_wilcox_test(cd19_blasts ~ thawing_date, ref.group = "2022-01-20") %>% 
+  filter(p.adj.signif != "ns")
 
 ```
 
