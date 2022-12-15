@@ -215,13 +215,13 @@ We remove all 13 samples with the lowest viability (\<15%). This leaves us with 
 ```{r}
 meta.all %>% 
   left_join(id_wise_qc) %>% 
-  filter(viability > 0.15) -> meta.all
+  filter(viability > 0.15) -> meta.all.filtered
 ```
 
 This still leaves 7 samples that violate 3 of the 4 QC criteria.
 
 ```{r}
-meta.all %>% 
+meta.all.filtered %>% 
   filter(pass == 1) %>% 
   DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
 ```
@@ -272,6 +272,9 @@ bind_cols(prot.all, "uniprotid_cor" = stringr::str_split(prot.all$uniprotid, pat
 
 prot.all %>% 
   dplyr::select(uniprotid, uniprotid_cor, gene_names) -> prot.id_vector.all
+
+prot.all %>% 
+  dplyr::select(uniprotid_cor, gene_names) -> prot.all.uniprot_hgnc
 
 prot.all %>% 
   dplyr::select(-uniprotid, -gene_names) %>% 
@@ -490,15 +493,33 @@ ref_channel_inter_plex_cor
 
 First, we normalize each plex to equal loadings. First, we calculate the mean of the column sums as the target size factor and apply the correction to every column and confirm that all columns have equal sum-intensities after correction.
 
+There exist several proteins with an raw intensity \< 100. Additionally, one measurement has an raw intensity of almost 0.
+
 ```{r}
 
-prot.all %>% colSums(na.rm = T) %>% mean() -> target_size_factor
+prot.all[prot.all <= 1 & !is.na(prot.all)] <- NA_integer_
+
+prot.all %>% colSums(na.rm = T) %>% mean(na.rm = T) -> target_size_factor
 
 target_size_factor/colSums(prot.all, na.rm = T) -> normalization_factor
- -
+
+
 assign("prot.all.slc", sweep(prot.all, MARGIN = 2, STATS = normalization_factor, FUN = "*")) #interestingly when using the <- assign operator, the entire matrix is with sign negative...
 
 prot.all.slc %>% colSums(na.rm = T) %>% all()
+
+# create a merged df for QC figures
+prot.all.slc %>%
+  as_tibble(rownames = "uniprotid") %>% 
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>%
+  mutate(sample_id = stringr::str_extract(string = sample, pattern = "\\d{1}"),
+         plex = stringr::str_extract(string = sample, pattern = "6\\d{2}"),
+         sample_fin = paste(sample_id, plex, sep = "_")) %>% 
+  group_by(sample_fin, uniprotid) %>% 
+  summarize(intensities = mean(intensities, na.rm = T)) -> prot.all.slc.merge
+
+prot.all.slc.merge %>% 
+  pivot_wider(id_cols = uniprotid, names_from = sample_fin, values_from = intensities) -> prot.all.slc.merge
 
 ```
 
@@ -512,22 +533,29 @@ We can investigate the effect of the sample loading correction
 #| - "Sample-wise densities"
 
 
-prot.all.slc %>% 
-  pivot_longer(cols = everything(), names_to = "sample", values_to ="intensities") %>% 
-  mutate(plex = factor(stringr::str_extract(string = sample, pattern = "r[1,2]_6\\d{2}"))) %>% 
-  ggplot(aes(x=sample, y = log(intensities), fill = factor(plex))) +
+prot.all.slc.merge %>% 
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to ="intensities") %>% 
+  mutate(plex = factor(stringr::str_extract(string = sample, pattern = "6\\d{2}"))) %>% 
+  ggplot(aes(x=sample, y = log2(intensities), fill = factor(plex))) +
   geom_boxplot(outlier.shape = NA) +
   cowplot::theme_cowplot() +
   scale_fill_viridis_d(name = "Plex") +
   theme(axis.text.x = element_blank())
 
-prot.all.slc %>% 
-  pivot_longer(cols = everything(), names_to = "sample", values_to ="intensities") %>% 
-  mutate(plex = factor(stringr::str_extract(string = sample, pattern = "r[1,2]_6\\d{2}"))) %>% 
-  ggplot(aes(x= log(intensities), col = factor(plex))) +
+prot.all.slc.merge %>% 
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to ="intensities") %>% 
+  mutate(plex = factor(stringr::str_extract(string = sample, pattern = "6\\d{2}"))) %>% 
+  ggplot(aes(x= log2(intensities), col = factor(plex))) +
   geom_density() +
   cowplot::theme_cowplot() +
   scale_color_viridis_d(name = "Plex")
+```
+
+```{r}
+prot.all.slc[, grepl(pattern = "uniprotid", colnames(prot.all.slc.merge))] %>% 
+  log2() %>% 
+  dplyr::select(contains("8_")) %>% 
+  psych::pairs.panels()
 ```
 
 #### Internal reference standard (IRS) normalization
@@ -535,13 +563,15 @@ prot.all.slc %>%
 Lastly, we can apply the internal reference scaling to normalize intensities within plexes. The internal reference standard was measured in channel #9 of each plex. We calculate a protein-wise normalization factor based on the averaged intensities over all reference channels divided by the plex-wise intensity. Then we apply a plex- and protein-wise normalization. Finally, the technical replicates are merged by mean intensities.
 
 ```{r}
-# we calculate for every protein the average intensity over all reference channels (#9 in our experiment) which gives a protein-wise target intensity. In the original manuscript, this is done in the log space so we keep with this 
+# we calculate for every protein the average intensity over all reference channels (#9 in our experiment) which gives a protein-wise target intensity. We use the geometric (exp(mean(log(x)))) instead of the arithmetric mean.
 
 prot.all.slc %>% 
   #head() %>% 
   dplyr::select(contains("9_")) %>%
   as.matrix() %>%  
-  matrixStats::rowMeans2(na.rm = T) -> irs_target_intensities
+  log() %>% 
+  matrixStats::rowMeans2(na.rm = T) %>% 
+  exp() -> irs_target_intensities
 
 # we then use the target intensities and calculate a protein-wise scaling factor (target intensits/measured intensity) for every plex' reference channel. This gives a scaling factor for every protein in every plex. Note, that R performs column-wise division. Note furthermore, that proteins are always missing in the entire plex.
 
@@ -568,12 +598,10 @@ prot.all.slc %>%
 ```
 
 ```{r}
-prot.all.slc.irs %>% dplyr::select(contains("r1")) %>% log2() %>% boxplot()
-```
-
-```{r}
 
 prot.all.slc.irs %>% 
+  dplyr::select(-contains("9_")) %>% 
+  log2() %>% 
   #head() %>% 
   as_tibble() %>% 
   dplyr::bind_cols("uniprotid" = rownames(prot.all)) %>% 
@@ -603,16 +631,6 @@ We plot some QC metrics to confirm the effect of the sample-loading and internal
 #| - "Post IRS + SLC sample-wise density plots"
 
 
-prot.all.slc %>% log() %>%
-  as_tibble(rownames = "uniprotid") %>% 
-  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>%
-  mutate(sample_id = stringr::str_extract(string = sample, pattern = "\\d{1}"),
-         plex = stringr::str_extract(string = sample, pattern = "6\\d{2}"),
-         sample_fin = paste(sample_id, plex, sep = "_")) %>% 
-  group_by(sample_fin, uniprotid) %>% 
-  summarize(intensities = mean(intensities, na.rm = T)) -> prot.all.slc.merge
-
-
 prot.all.slc.merge %>% 
   mutate(plex = as.numeric(stringr::str_extract(string = sample_fin, pattern = "6\\d{2}"))) %>% 
   ggplot(aes(x=fct_reorder(sample_fin, plex), y = intensities, fill = as.factor(plex))) +
@@ -622,7 +640,7 @@ prot.all.slc.merge %>%
   cowplot::theme_minimal_grid()+
   cowplot::panel_border() +
   labs(x="", y = "log2 intensities") +
-  scale_fill_viridis_d(name = "plex") -> boxplot.slc
+  scale_fill_viridis_d(name = "plex") 
 
 
 
@@ -645,16 +663,374 @@ prot.all.slc.irs.merge %>%
   cowplot::theme_minimal_grid()+
   cowplot::panel_border() +
   labs(x="", y = "log2 intensities") +
-  scale_fill_viridis_d(name = "plex") -> boxplot.irs.slc
+  scale_fill_viridis_d(name = "plex")
 
 
 
 prot.all.slc.irs.merge %>% 
-  #log() %>% 
   pivot_longer(cols = everything(), names_to = "sample", values_to = "intensities") %>% 
   ggplot(aes(x=intensities, col = sample)) +
   geom_density() +
   cowplot::theme_minimal_grid() +
   cowplot::panel_border() +
   theme(legend.position = "none") 
+
 ```
+
+Intensities over random plex
+
+```{r}
+prot.all.slc.irs.merge %>% 
+  dplyr::select(contains("8_")) %>% 
+  psych::pairs.panels()
+```
+
+### Investigation
+
+#### Missing values
+
+We calculate for each protein the number of samples in which it is not quantified.
+
+```{r}
+is.na(prot.all.slc.irs.merge) %>% 
+  matrixStats::rowSums2(useNames = T) %>% 
+  as_tibble(rownames = "uniprotid") %>% 
+  mutate(no_missing = value/ncol(prot.all.slc.irs.merge) * 100) -> prot.all.slc.irs.merge.missingness_by_protein
+
+prot.all.slc.irs.merge.missingness_by_protein %>% 
+  ggplot(aes(x=no_missing, fill = no_missing > 50))+
+  geom_histogram(position = position_identity())+
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border()+
+  theme(legend.position = "none") +
+  labs(x="Percent missing", y="", caption = paste0("blue = missing in more than 50% of samples\nn ", nrow(prot.all.slc.irs.merge.missingness_by_protein[prot.all.slc.irs.merge.missingness_by_protein$no_missing>50,]), " proteins"))
+```
+
+`r nrow(prot.all.slc.irs.merge.missingness_by_protein[prot.all.slc.irs.merge.missingness_by_protein$no_missing>50,])` of the `r nrow(prot.all.slc.irs.merge)` proteins quantified are missing in more than 50% of the samples and are removed from further down stream analyses.
+
+```{r}
+prot.all.slc.irs.merge.missingness_by_protein %>% 
+  filter(no_missing > 50) %>% pull(uniprotid) -> high_missingness_proteins
+
+prot.all.slc.irs.merge[!rownames(prot.all.slc.irs.merge) %in% high_missingness_proteins, ] -> prot.all.slc.irs.merge.filtered
+```
+
+This leaves `r nrow(prot.all.slc.irs.merge.filtered)` proteins.
+
+```{r}
+prot.all.slc.irs.merge.filtered %>% 
+  dplyr::select(contains("1_")) %>% 
+  as.matrix() %>% 
+  is.na() %>% 
+  matrixStats::colSums2(useNames = T) %>% 
+  as_tibble(rownames = "plex") %>% 
+  mutate(value = value/nrow(prot.all.slc.irs.merge)*100, 
+         plex = stringr::str_remove(string = plex, "1_"),
+         plex = factor(plex)) -> prot.all.slc.irs.merge.filtered.missingness_by_plex 
+
+prot.all.slc.irs.merge.filtered.missingness_by_plex %>% 
+  ggplot(aes(x=fct_reorder(plex, value), y = value)) +
+  geom_col() +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border()+
+  labs(x = "Plex", y = "Missing proteins [%]")
+```
+
+After removing proteins with high missingness, no individual plex has more than 10% missing proteins.
+
+#### Histogram of quantified proteins per sample
+
+```{r}
+is.na(prot.all.slc.irs.merge.filtered) %>% 
+  matrixStats::colSums2(useNames = T) %>% 
+  as_tibble(rownames = "sample") %>% 
+  mutate(value = nrow(prot.all.slc.irs.merge.filtered) - value) %>% 
+  {
+    ggplot(.,aes(x=value)) +
+      geom_histogram(bins = 30) +
+      cowplot::theme_minimal_grid() +
+      cowplot::panel_border() +
+      geom_vline(xintercept = median(.$value), size = 2, linetype = "dashed", col = "blue") +
+      labs(caption = paste0("median quantified proteins: ",median(.$value)), x = "")
+    }
+  
+```
+
+#### CV
+
+Plex-wise coefficient of variation (CV)
+
+```{r}
+prot.all.slc.irs.merge.filtered %>% 
+  as_tibble(rownames = "uniprotid") %>%
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>%
+  mutate(plex = stringr::str_extract(string = sample, pattern = "6\\d{2}")) %>%
+  nest_by(plex) %>%
+  {
+    split(.$data, .$plex)
+  } %>%
+  purrr::imap(~ pivot_wider(.x[[1]], id_cols = uniprotid, names_from = sample, values_from = intensities) %>%
+               column_to_rownames("uniprotid") %>%
+                as.matrix() %>% 
+                 apply(MARGIN = 1, FUN = function(x) sd(x, na.rm =T)/mean(x, na.rm = T))) %>% 
+  bind_cols() %>% 
+  bind_cols("uniprotid" = rownames(prot.all.slc.irs.merge.filtered)) %>% 
+  pivot_longer(cols = -uniprotid, names_to = "plex", values_to = "protein_wise_cv") -> prot.all.slc.irs.merge.filtered_cv 
+
+prot.all.slc.irs.merge.filtered_cv %>% 
+  ggplot(aes(x=factor(plex), y = protein_wise_cv*100, fill = as.factor(plex))) +
+  geom_violin() +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  theme(legend.position = "none") +
+  labs(x = "", y = "CV [%]")
+```
+
+#### CV per protein
+
+```{r}
+prot.all.uniprot_hgnc %>% 
+  deframe() -> uniprotid_to_hgnc
+
+prot.all.slc.irs.merge.filtered_cv %>% 
+  group_by(uniprotid) %>% 
+  summarize(cv = median(protein_wise_cv)) %>% 
+  #mutate(uniprotid = factor(uniprotid)) %>% 
+  ggplot(aes(x=fct_reorder(uniprotid, cv), y = cv*100)) +
+  geom_point() +
+  labs(x="", y = "CV [%]") +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  theme(axis.text.x = element_blank()) +
+  ggrepel::geom_text_repel(aes(label = uniprotid_to_hgnc[uniprotid]))
+```
+
+#### Pattern of missingness
+
+```{r}
+is.na(prot.all.slc.irs.merge.filtered) %>% 
+  matrixStats::rowSums2(useNames = T) %>% 
+  as_tibble(rownames = "uniprotid") %>% 
+  left_join(
+    prot.all.slc.irs.merge %>% 
+      as.matrix() %>% 
+      matrixStats::rowMeans2(useNames = T, na.rm = T) %>% 
+      as_tibble(rownames = "uniprotid"), by=c("uniprotid")
+  ) %>% 
+  dplyr::rename("no_missing" = "value.x",
+                "mean" = "value.y") %>% 
+  left_join(prot.all.slc.irs.merge %>% 
+      as.matrix() %>% 
+      matrixStats::rowSds(useNames = T, na.rm = T) %>% 
+      as_tibble(rownames = "uniprotid"), by=c("uniprotid")) %>% 
+  dplyr::rename("sd" = "value") -> prot.all.mean_variance_nomissing
+
+prot.all.mean_variance_nomissing %>% 
+  filter(no_missing > 0) %>% 
+  ggplot(aes(x=no_missing, y = mean)) +
+  geom_point() +
+  stat_smooth(method ="lm", aes(group = 1)) +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  ggpubr::stat_cor(aes(group = 1)) +
+  labs(x="Missing proteins [no]", y = "Mean log2 intensities") +
+  theme(legend.position = "none")
+```
+
+As expected, there's a negative linear correlation between proteins with high missingness and log2 intensity. i.e. proteins with high missingness tend to have lower intensity thereby having higher likelihood of not being detected by the MS.
+
+```{r}
+prot.all.mean_variance_nomissing %>% 
+  ggplot(aes(x=mean, y = sd)) +
+  geom_point() +
+  stat_smooth(method ="lm") +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  ggpubr::stat_cor() +
+  labs(x="Mean log2 intensities", y = "SD log2 intensities")
+```
+
+After log2 transformation there's no relevante mean-variance dependency.
+
+#### Principal component analysis
+
+##### General probabilistic PCA
+
+Calculated with missing values
+
+```{r}
+prot.all.slc.irs.merge.filtered %>% 
+  t() %>% 
+  pcaMethods::pca() %>% 
+  pcaMethods::scores() %>% 
+  as_tibble(rownames = "sample") %>% 
+  mutate(plex = stringr::str_extract(string = sample, pattern = "6\\d{2}")) %>% 
+  ggplot(aes(x=PC1, y = PC2, col = plex)) +
+  geom_point() +
+  labs(x="PC1, 27% variance explained", y = "PC2, 13% variance explained") +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border()
+```
+
+##### PCA colored by NA
+
+```{r}
+prot.all.slc.irs.merge.filtered %>% 
+  t() %>% 
+  pcaMethods::pca() %>% 
+  pcaMethods::scores() %>% 
+  as_tibble(rownames = "sample") %>%
+  mutate(plex = stringr::str_extract(string = sample, pattern = "6\\d{2}")) %>% 
+  left_join(prot.all.slc.irs.merge.missingness_by_plex, by="plex") %>% 
+  dplyr::rename("no_missingnes" = "value") %>% 
+  ggplot(aes(x=PC1, y = PC2, col = no_missingnes)) +
+  geom_point() +
+  labs(x="PC1, 27% variance explained", y = "PC2, 13% variance explained") +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  scale_color_viridis_c()
+```
+
+Correlation between PC 1 to 10 scores and number of missing proteins
+
+```{r}
+prot.all.slc.irs.merge.filtered %>% 
+  t() %>% 
+  pcaMethods::pca(nPcs = 10) %>% 
+  pcaMethods::scores() %>% 
+  as_tibble(rownames = "sample") %>%
+  mutate(plex = stringr::str_extract(string = sample, pattern = "6\\d{2}")) %>% 
+  left_join(prot.all.slc.irs.merge.missingness_by_plex, by="plex") %>% 
+  dplyr::rename("no_missingnes" = "value") %>% 
+  dplyr::select(-sample) %>% 
+  rstatix::cor_test(vars = no_missingnes, method = "spearman") %>% 
+  rstatix::adjust_pvalue() %>% 
+  rstatix::add_significance() %>% 
+  DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+After correction for multiple testing, the first PC is marginally correlated with number of missing proteins, hence missingness is a driver of variance in this data set.
+
+#### Correlation with sample features
+
+We now investiage the impact of sample features on the proteome.
+
+```{r}
+prot.all.id_mapping <- readxl::read_excel("Data/Metadata/20220609_ALL_PROTGEN_IDENTIFIER.xlsx") %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(identifier, prot_id) %>% 
+  mutate(prot_id = paste0(stringr::str_extract(prot_id, "(?<=_)\\d"), "_", stringr::str_extract(prot_id, "6\\d{2}")))
+
+prot.all.id_mapping
+
+meta.all %>% 
+  left_join(prot.all.id_mapping, by=c("ID" = "identifier")) -> meta.all
+
+meta.all %>% 
+  filter(is.na(prot_id))
+
+```
+
+Two samples, 11103 and 26511 are not re-identified in the data set.
+
+```{r}
+tibble(sample = colnames(prot.all.slc.irs.merge.filtered)) %>% 
+  left_join(dplyr::select(meta.all, prot_id, ID), by=c("sample" = "prot_id")) %>% 
+  mutate(filtered = !(ID %in% meta.all.filtered$ID)) %>% 
+  filter(filtered == T) %>% 
+  pull(sample) -> low_viability_samples
+```
+
+15 proteomic samples are in principle not mapped to meta data since they were removed due low viability \<15%. Of the remaining protein samples, all are mapped to the meta data. Hence we can remove the low viability samples from the proteome as well.
+
+```{r}
+prot.all.slc.irs.merge.filtered[, !colnames(prot.all.slc.irs.merge.filtered) %in% low_viability_samples] -> prot.all.slc.irs.merge.filtered
+```
+
+This leaves a final data set with a dimensionality of `dim(prot.all.slc.irs.merge.filtered)`
+
+```{r}
+prot.all.slc.irs.merge.filtered %>% 
+  t() %>% 
+  pcaMethods::pca(nPcs = 10) %>% 
+  pcaMethods::scores() %>% 
+  as_tibble(rownames = "sample") -> prot.all.slc.irs.merge.filtered.10PCs
+
+```
+
+We can now calculate a correlation matrix where we test every of the first 10 PCs against the sample metadata including
+
+-   cells per ml
+
+-   alive cells per ml
+
+-   viability
+
+-   total number of cells
+
+-   total number of alive cells
+
+-   blasts per CD45/SSC gate
+
+-   CD19+ blasts
+
+-   protein concentration \[mu/ml\]
+
+And filter this matrix for statistically significant correlations (FDR \<5%)
+
+```{r}
+prot.all.slc.irs.merge.filtered.10PCs %>% 
+  left_join(meta.all, by=c("sample" = "prot_id")) %>% 
+  rstatix::cor_test(vars = c(PC1:PC10), vars2=c(cells_per_ml:protein_conc_mu_per_ml), method = "spearman") %>% 
+  rstatix::adjust_pvalue() %>% 
+  rstatix::add_significance() %>% 
+  arrange(desc(-log(p.adj))) %>% 
+  filter(p.adj.signif != "ns")
+```
+
+This shows that the 1st PC is strongly correlated with viability and, to a lesser extent, the amount of CD19+ blasts. PC3 is moderately correlated with cellular content and protein concentration as is PC4.
+
+```{r}
+prot.all.slc.irs.merge.filtered %>% 
+  as_tibble(rownames = "uniprotid") %>% 
+  pivot_longer(cols = -uniprotid, names_to = "sample", values_to = "intensities") %>% 
+  left_join(dplyr::select(meta.all, prot_id,thawing_date), by=c("sample" = "prot_id")) %>% 
+  group_by(uniprotid, thawing_date) %>% 
+  summarize(intensities = mean(intensities, na.rm = T)) %>% 
+  ggplot(aes(x=as.factor(thawing_date), y = intensities, fill = as.factor(thawing_date))) +
+  geom_boxplot() +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  ggpubr::stat_compare_means()+
+  theme(legend.position = "none") +
+  scale_fill_viridis_d() +
+  labs(x = "Thawing date", y = "log2 intensities")
+```
+
+From visual inspections, there might be a slight bias in the samples thawed at 2022-01-20.
+
+```{r}
+meta.all.filtered %>% 
+  rstatix::pairwise_wilcox_test(viability ~ thawing_date, ref.group = "2022-01-20")
+
+meta.all.filtered %>% 
+  rstatix::pairwise_wilcox_test(cells_per_ml ~ thawing_date, ref.group = "2022-01-20")
+
+meta.all.filtered %>% 
+  rstatix::pairwise_wilcox_test(alive_cells_per_ml ~ thawing_date, ref.group = "2022-01-20")
+
+meta.all.filtered %>% 
+  rstatix::pairwise_wilcox_test(cells_total ~ thawing_date, ref.group = "2022-01-20")
+
+meta.all.filtered %>% 
+  rstatix::pairwise_wilcox_test(alive_cells_total ~ thawing_date, ref.group = "2022-01-20")
+
+meta.all.filtered %>% 
+  rstatix::pairwise_wilcox_test(cd45_blasts ~ thawing_date, ref.group = "2022-01-20")
+
+meta.all.filtered %>% 
+  rstatix::pairwise_wilcox_test(cd19_blasts ~ thawing_date, ref.group = "2022-01-20")
+
+```
+
+However, none of the sample parameters is significantly different when comparing all thawing dates to the 2022-01-20.
