@@ -875,7 +875,9 @@ prot.all.slc.irs.merge.filtered %>%
   geom_point() +
   labs(x="PC1, 27% variance explained", y = "PC2, 13% variance explained") +
   cowplot::theme_minimal_grid() +
-  cowplot::panel_border()
+  cowplot::panel_border() -> p
+
+ggExtra::ggMarginal(p, groupFill = T, groupColour = T)
 ```
 
 ##### PCA colored by NA
@@ -932,6 +934,9 @@ prot.all.id_mapping
 meta.all %>% 
   left_join(prot.all.id_mapping, by=c("ID" = "identifier")) -> meta.all
 
+meta.all.filtered %>% 
+  left_join(prot.all.id_mapping, by=c("ID" = "identifier")) -> meta.all.filtered
+
 meta.all %>% 
   filter(is.na(prot_id))
 
@@ -939,7 +944,7 @@ meta.all %>%
 
 ```
 
-Two samples, 11103 and 26511 are not re-identified in the data set.
+Two samples, 11103 and 26511 are not re-identified in the data set. Furthermore, one sample, P647_3 (ID 20718) is found in the meta data but not in the proteomic data set.
 
 ```{r}
 tibble(sample = colnames(prot.all.slc.irs.merge.filtered)) %>% 
@@ -989,7 +994,7 @@ And filter this matrix for statistically significant correlations (FDR \<5%)
 ```{r}
 prot.all.slc.irs.merge.filtered.10PCs %>% 
   left_join(meta.all, by=c("sample" = "prot_id")) %>% 
-  rstatix::cor_test(vars = c(PC1:PC10), vars2=c(cells_per_ml:pass), method = "spearman") %>% 
+  rstatix::cor_test(vars = c(PC1:PC10), vars2=c(cells_per_ml:protein_conc_mu_per_ml), method = "spearman") %>% 
   rstatix::adjust_pvalue() %>% 
   rstatix::add_significance() %>% 
   arrange(desc(-log(p.adj))) %>% 
@@ -997,7 +1002,7 @@ prot.all.slc.irs.merge.filtered.10PCs %>%
   DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
 ```
 
-This shows that the 1st PC is strongly correlated with viability and, to a lesser extent, the amount of CD19+ blasts. PC3 is moderately correlated with cellular content, protein concentration and the integrated QC metric "pass".
+This shows that the 1st PC is strongly correlated with viability and, to a lesser extent, the amount of CD19+ blasts. PC3 is moderately correlated with cellular content, protein concentration.
 
 ```{r}
 #| label: PC1_scores
@@ -1031,7 +1036,6 @@ prot.all.slc.irs.merge.filtered.10PCs %>%
   ggpubr::stat_cor(method = "spearman")
 ```
 
-
 ```{r}
 prot.all.slc.irs.merge.filtered %>% 
   as_tibble(rownames = "uniprotid") %>% 
@@ -1052,34 +1056,47 @@ prot.all.slc.irs.merge.filtered %>%
 From visual inspections, there might be a slight bias in the samples thawed at 2022-01-20.
 
 ```{r}
-meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(viability ~ thawing_date, ref.group = "2022-01-20") %>% 
-  filter(p.adj.signif != "ns")
 
-meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(cells_per_ml ~ thawing_date, ref.group = "2022-01-20") %>% 
-  filter(p.adj.signif != "ns")
+apply(X = dplyr::select(meta.all.filtered, viability:cd19_blasts), MARGIN = 2, FUN = function(x) 
+  {
+    p_val <- pairwise.wilcox.test(x = x, g = meta.all.filtered$thawing_date) 
+    names_vec <- outer(rownames(p_val$p.value), colnames(p_val$p.value), paste, sep = " v ")
+    p_val <- as.vector(p_val$p.value)
+    names(p_val) <- names_vec
+    return(p_val)
+  }) -> pval
 
-meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(alive_cells_per_ml ~ thawing_date, ref.group = "2022-01-20") %>% 
-  filter(p.adj.signif != "ns")
-
-meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(cells_total ~ thawing_date, ref.group = "2022-01-20") %>% 
-  filter(p.adj.signif != "ns")
-
-meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(alive_cells_total ~ thawing_date, ref.group = "2022-01-20") %>% 
-  filter(p.adj.signif != "ns")
-
-meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(cd45_blasts ~ thawing_date, ref.group = "2022-01-20") %>% 
-  filter(p.adj.signif != "ns")
-
-meta.all.filtered %>% 
-  rstatix::pairwise_wilcox_test(cd19_blasts ~ thawing_date, ref.group = "2022-01-20") %>% 
-  filter(p.adj.signif != "ns")
-
+pval %>% as_tibble(rownames = "comparison") %>% 
+  pivot_longer(cols = -comparison, names_to = "feature", values_to = "pval") %>% 
+  filter(pval < 0.05)
 ```
 
-However, none of the sample parameters is significantly different when comparing all thawing dates to the 2022-01-20.
+For any combination of thawing dates, total number of alive cells is significantly different between the samples thawed at the 17th and 26th of January. The same is true for total cells between the 18th and the 26th and 27th respectively.
+
+## Summary
+
+In sum, we have generated the final proteomic data set including `r ncol(prot.all.slc.irs.merge.filtered)` samples for which `r nrow(prot.all.slc.irs.merge.filtered)` proteins were quantified. Samples with a viability of less than 15% and proteins with a coverage of less than 50% were removed. Sample loading correction and internal reference scaling were applied to the data set to account for TMT plex bias. Correlation with the sample parameters revealed a significant bias of the proteomic data set towards sample viability and CD19 blast count. Additional drivers of lower-rank principal components were the total number of cells, the total number of alive cells and the protein concentration.
+
+```{r}
+prot.all.slc.irs.merge.filtered -> prot.all
+
+meta.all.filtered %>% 
+  filter(!is.na(prot_id)) %>% 
+  column_to_rownames("prot_id") -> meta.all
+
+library(SummarizedExperiment)
+
+SummarizedExperiment::SummarizedExperiment(assays = list(
+  "protein_unimputed" = as.matrix(prot.all)),
+  colData = meta.all[colnames(prot.all),]) -> all.summarizedExperiment
+
+#saveRDS(all.summarizedExperiment, paste0(Sys.Date(), "_ALLproteomics.summarizedExperiment.RDS"))
+```
+
+# Session Info
+
+Last rendered `r Sys.Date()`
+
+```{r}
+sessionInfo()
+```
