@@ -1,0 +1,848 @@
+---
+title: "ALL Proteomics_Data Exploration"
+author: "Sebastian Wolf"
+toc: true
+format:
+  html:
+    theme: litera
+    self-contained: true
+    code-fold: true
+knitr:
+  opts_chunk:
+    message: false
+    warning: false
+bibliography: references.bib
+---
+
+# Introduction
+
+The data set contains TMT-based proteomic data for 94 B-cell precursor acute lymphoblastic leukemia (ALL) samples from the German ALL study group (GMALL). Data carpentry, sample loading correction and internal reference standard (IRS) normalization was performed. Samples with \<15% viability and proteins with \<50% coverage over all samples were removed. Finally, initial investigation into correlation with sample parameters (e.g. sample viability, total number of cells, CD19+ blast cell count) was performed and reported.
+
+In this vignette, we use the finalized data set to perform data investigation.
+
+# Clustering
+
+For a first discovery stage of the data set, we perform unbiased sample clustering. For this, we use the unimputed data set since in proteomics, missing values carry information (proteins have intensity below the threshold of detection) and are hence not random artifacts. However, the majority of clustering methods and also frameworks don't allow for missing values. Hence we first need to project the data set into a space without missing values. This can be achieved by several (linear or non linear) methods.
+
+For a first iteration, we project the data set into the space of [Euclidean distances](https://en.wikipedia.org/wiki/Euclidean_distance). We do this by calculating the pairwise distances based on the set of shared non-missing proteins. This gives a sample x sample rectangular matrix with higher values meaning more dis-similiarty and lower values meaning less dis-similarity (down to 0 when comparing the same sample with itself).
+
+```{r}
+library(SummarizedExperiment)
+library(tidyverse)
+
+all.summarizedExperiment <- readRDS("2022-12-20_ALLproteomics.summarizedExperiment.RDS")
+
+assay(all.summarizedExperiment, "protein_unimputed") -> prot.all
+
+colData(all.summarizedExperiment) %>% 
+  as_tibble(rownames = "prot_id") -> meta.all
+```
+
+```{r}
+rownames(prot.all) %>% 
+  clusterProfiler::bitr(fromType = "UNIPROT", toType = "SYMBOL", OrgDb = "org.Hs.eg.db") %>% 
+  distinct(UNIPROT, .keep_all =T) %>% 
+  deframe() -> uniprotid_to_hgnc_symbol
+
+rownames(prot.all) %>% 
+  clusterProfiler::bitr(fromType = "UNIPROT", toType = "ENTREZID", OrgDb = "org.Hs.eg.db") %>% 
+  distinct(UNIPROT, .keep_all =T) %>% 
+  deframe() -> uniprotid_to_entrez
+
+rownames(prot.all) %>% 
+  clusterProfiler::bitr(fromType = "UNIPROT", toType = "SYMBOL", OrgDb = "org.Hs.eg.db") %>% 
+  distinct(UNIPROT, .keep_all =T) %>% 
+  dplyr::select(SYMBOL, UNIPROT) %>% 
+  deframe() -> hgnc_symbol_to_uniprotid
+```
+
+We can visualize this dis-similarity matrix using a heatmap. Additionally, we can annotate the heatmap with all sample parameters of interest (i.e. those identified as variant-driving).
+
+```{r}
+#| fig-width: 9
+#| fig-height: 12
+#| fig-align: "center"
+
+
+vegan::vegdist(t(prot.all), method = "euclidean", binary = F, diag = T, upper = F, na.rm = T) -> prot.all.dist
+
+ComplexHeatmap::HeatmapAnnotation(df = as.data.frame(meta.all) %>% dplyr::select(subtyp, thawing_date:pass)) -> all.heatmap_annotation
+
+prot.all.dist %>% 
+  as.matrix() %>% 
+  ComplexHeatmap::Heatmap(top_annotation = all.heatmap_annotation, show_row_names = F, show_column_names = F) %>% ComplexHeatmap::draw(heatmap_legend_side = "right", annotation_legend_side = "bottom")
+```
+
+Because clustering is inherently heuristic (no ground truth) we use the cola framework [@gu2021]to test a collection of clustering methods and calculate different clustering metrices to quasi-empirical decide on a good clustering strategy.
+
+```{r}
+#| eval: false
+
+
+library(cola)
+library(NMF)
+library(kohonen)
+
+register_NMF()
+register_SOM()
+
+register_top_value_methods(all = function(x) rep(1, nrow(x)))
+
+run_all_consensus_partition_methods(
+  data = prot.all.dist, 
+  top_value_method = "all",
+  partition_method = all_partition_methods(),
+  anno = as.data.frame(meta.all) %>% dplyr::select(subtyp, thawing_date:pass),
+  top_n = nrow(as.matrix(prot.all.dist)),
+  scale_rows = F, 
+  cores = parallel::detectCores() - 1,
+  max_k = 6,
+  verbose = T) -> prot.all.cola_out
+
+saveRDS(prot.all.cola_out, file = "prot.all.cola_out.RDS")
+```
+
+```{r}
+library(cola)
+prot.all.cola_out <- readRDS(file = "prot.all.cola_out.RDS")
+```
+
+```{r}
+suggest_best_k(prot.all.cola_out) %>% 
+ DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+The clustering framework identifies a k of 2 as the optimal clustering solution. This is highly suspicious for low viability samples driving this clustering.
+
+```{r}
+#| fig-width: 15
+#| fig-height: 10
+#| fig-align: "center"
+
+
+collect_classes(prot.all.cola_out, k = 2)
+```
+
+As expected, the main dichotomy is between low and normal to high viability samples. We can visualize this.
+
+```{r}
+get_classes(prot.all.cola_out["all:hclust"], k = 2) %>% 
+  as_tibble(rownames = "prot_id") %>% 
+  left_join(meta.all) %>% 
+  mutate(class = factor(class)) %>% 
+  ggplot(aes(x=class, y = viability * 100, fill = class)) +
+  geom_boxplot() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  ggpubr::stat_compare_means(comparisons = list(c("1", "2"))) +
+  theme(legend.position = "none") +
+  scale_fill_viridis_d(option = "E" ) 
+```
+
+This justifies a further filtering on low viability samples. However, the question remains where to set a sensible cut off to balance sample number with viability. One possible way to do this is to iterate through different cutoffs and investigate the impact on the statistical correlation between viability and PC1 (which is currently highly significant).
+
+```{r}
+
+lapply(seq(0.15, 0.7, by=0.02),  FUN = function(x)
+  {
+    target_ids <- meta.all[meta.all$viability >= x, ]$prot_id
+    prot.all[, target_ids] %>% 
+      t() %>% 
+      pcaMethods::pca() %>% 
+      pcaMethods::scores() -> pc
+    pc %>% 
+      as_tibble(rownames = "prot_id") %>% 
+      left_join(dplyr::select(meta.all, prot_id, viability), by = c("prot_id")) %>% 
+      rstatix::cor_test(vars = c("PC1", "viability"), method = "spearman") %>% 
+      return()
+  }) %>% 
+  bind_rows() %>% 
+  bind_cols("viability_cutoff" = seq(0.15, 0.7, by=0.02)) -> viability_cutoff
+  
+```
+
+```{r}
+viability_cutoff %>%
+  rstatix::adjust_pvalue(p.col = "p") %>% 
+  ggplot(aes(x=viability_cutoff, y = -log(p.adj), col = p.adj < 0.01)) +
+  geom_point() +
+  theme(legend.position = "none") +
+  cowplot::theme_minimal_grid()+ 
+  cowplot::panel_border() +
+  labs(x="Viability cutoff", y = "-log(adjusted p-value)")
+```
+
+As apparent from the plot, any cutoff from 0.2 to 0.7 results in a significant correlation between viability and PC1. From the "elbow method" it would seem like 0.4 could be a sensitive cutoff however this would mean removing a total of `r nrow(filter(meta.all, viability < 0.4))` samples.
+
+A list of samples that would violate the viability cutoff (FALSE).
+
+```{r}
+lapply(X = seq(0.15, 0.5, 0.02), FUN = function(n) table(factor(meta.all$viability >= n))) %>% 
+  bind_rows() %>% 
+  bind_cols("viability_cutoff" = seq(0.15, 0.5, 0.02))
+
+```
+
+Removing this many samples seems rather brute force. An alternative approach would be to instead of removing samples, correcting for the dimension explained by the viability signature. In our case, this would mean correcting for the first PC as it is highly correlated with viability and CD19 blast count.
+
+However, we will still remove some additional very low samples with viability less than 20%.
+
+```{r}
+
+meta.all %>% filter(viability <= 0.2) %>% pull(prot_id) -> very_low_viability_samples
+
+meta.all %>% filter(viability > 0.2) -> meta.all
+prot.all[, !colnames(prot.all) %in% very_low_viability_samples] -> prot.all
+```
+
+For removing the first PC which is highly correlated to viability, there are different ways to achieve this. One way is to first project the data set into the latent PCA space, remove unwanted PCs and then use the remaining subset of PCs to perform non-linear community detection (e.g. Leiden clustering). The latter is preferred over methods such as hierarchical or kmeans clustering since linear distance measurements (e.g. euclidean distance) are not validated for latent spaces.
+
+## Non-linear community detection
+
+### Projection into corrected latent space
+
+```{r}
+prot.all %>% 
+  t() %>% 
+  pcaMethods::pca(nPcs = ncol(prot.all)) -> prot.all.pca
+
+prot.all.pca %>% 
+  pcaMethods::scores() -> prot.all.scores
+```
+
+We calculate all PCs from the proteomic data set. Next, we infer all the PCs that significantly correlate with sample viability.
+
+```{r}
+prot.all.scores %>% 
+  as_tibble(rownames = "prot_id") %>% 
+  left_join(dplyr::select(meta.all, prot_id, viability)) %>% 
+  rstatix::cor_test(vars = "viability", vars2 = paste0("PC", seq(1:ncol(prot.all.scores))),method = "spearman") -> viab_cor_pcs
+
+viab_cor_pcs %>% 
+  rstatix::adjust_pvalue() %>% 
+  arrange(p.adj) %>% 
+  filter(p.adj <= 0.01) %>% 
+  pull(var2) -> viab_cor_pcs_sig
+```
+
+We can first visualize the first top PCs which are not correlated with viability
+
+```{r}
+prot.all.scores[, !colnames(prot.all.scores) %in% viab_cor_pcs_sig] %>% 
+  as_tibble(rownames = "prot_id") %>% 
+  {
+    setNames(.,c("prot_id", paste0("PC", seq(1,ncol(.)-1,1))))
+  } %>% 
+  left_join(meta.all) %>% 
+  ggplot(aes(x=PC1, y = PC2, col = viability)) +
+  geom_point() +
+  cowplot::theme_minimal_grid()+
+  cowplot::panel_border() +
+  scale_color_viridis_c()
+
+```
+
+### KNN graph
+
+Now we use the subset of PCs which are not significantly correlated with viability to calculate the KNN matrix (it identifies for every sample the ID of the 15 nearest samples.
+
+```{r}
+
+RANN:::nn2(as.matrix(prot.all.scores[, !colnames(prot.all.scores) %in% viab_cor_pcs_sig]), k = 15)$nn.idx -> prot.all.knn
+```
+
+Using the membership matrix we build an adjacency matrix which codes for every PC if another PC is within its nearest neighbours (1) or not (0).
+
+```{r}
+matrix(0, nrow(prot.all.knn), nrow(prot.all.knn)) -> adjacency_matrix
+rownames(adjacency_matrix) <- colnames(adjacency_matrix) <- rownames(prot.all.scores)
+
+
+for(i in 1:nrow(prot.all.knn)) {
+    adjacency_matrix[i,rownames(prot.all.scores)[prot.all.knn[i,]]] <- 1
+}
+
+```
+
+### Community detection
+
+The adjacency matrix is then used to perform iterative community detection by [Leiden clustering](https://cran.r-project.org/web/packages/leiden/vignettes/run_leiden.html).
+
+```{r}
+igraph::graph_from_adjacency_matrix(adjacency_matrix, mode = "undirected", diag = F) -> knn_graph
+
+plot(knn_graph)
+```
+
+To infer stability of the detected communities, we can repeat this 1000 times and plot one exemplary solution on top of the KNN graph.
+
+```{r}
+lapply(seq(1,1000, 1), FUN = leidenAlg::leiden.community, graph = knn_graph, resolution = 1.3) %>% 
+  map(~ return(.$membership)) %>% 
+  bind_rows() -> leiden_membershipmatrix
+
+
+```
+
+```{r}
+RCy3::paletteColorBrewerAccent(value.count = max(as.numeric(leiden_membershipmatrix[1,])+1)) -> cols
+
+igraph::V(knn_graph)$color <- cols[as.numeric(leiden_membershipmatrix[sample(1:1000,1),])+1]
+plot(knn_graph)
+```
+
+### Hamming distance
+
+We can now use the information from 1000 iterations of Leiden clustering to infer similarity information between the samples. This can be formalized using the [Hamming distance](https://en.wikipedia.org/wiki/Hamming_distance) which measures the (dis)similarity between two sets of strings on a positional basis. In our case, for every sample, we have a string of length 1000 where every character is an assigned community per iteration. Samples that overlap on many of iterations of Leiden clustering are thought to be more similar (because they more often than not end up in the same community, similar to a silhouette score).
+
+We can visualize the Hamming distance as a heatmap.
+
+```{r}
+heatmap_cols <- circlize::colorRamp2(breaks = c(0,500,1000), colors = c("#003049", "white", "#d62828"))
+
+e1071::hamming.distance(t(as.matrix(leiden_membershipmatrix))) %>% 
+  ComplexHeatmap::Heatmap(col = heatmap_cols, show_row_names = F, show_column_names = F)
+```
+
+The heatmap overlaps very well with the example communities plotted above.
+
+### COLA framework
+
+We can now again make use of the cola framework to consensus partition the Hamming distance matrix.
+
+```{r}
+library(e1071)
+
+leiden_membershipmatrix <- as.matrix(leiden_membershipmatrix)
+leiden_membershipmatrix.numeric <- apply(leiden_membershipmatrix, MARGIN = 2, as.numeric)
+
+register_partition_methods(
+    hclust_hamming = function(mat, k) {
+    library(tidyverse)
+    apply(mat, MARGIN = 2, as.numeric) %>% 
+        t() %>% 
+        e1071::hamming.distance() %>% 
+        as.dist() %>% 
+        hclust() %>% 
+        cutree(k) %>% 
+        return()
+    }
+)
+
+register_top_value_methods(all = function(x) rep(1, nrow(x)))
+
+run_all_consensus_partition_methods(
+  data = leiden_membershipmatrix.numeric, 
+  top_value_method = "all",
+  partition_method = "hclust_hamming",
+  anno = as.data.frame(meta.all) %>% dplyr::select(subtyp, thawing_date:pass),
+  top_n = ncol(leiden_membershipmatrix),
+  scale_rows = F, 
+  cores = parallel::detectCores() - 1,
+  max_k = 10,
+  verbose = T) -> prot.all.hamming_distance.cola.out
+```
+
+We can not look at the partition metrices in detail
+
+```{r}
+suggest_best_k(prot.all.hamming_distance.cola.out)
+```
+
+Based on the metrices, cola suggest a k of 9 as the optimal solution.
+
+```{r}
+select_partition_number(prot.all.hamming_distance.cola.out["all:hclust_hamming"])
+```
+
+However, the Jaccard and Rand scores for k \> 6 are very high suggesting that not much information is gained from increasing the number of clusters. Furthermore, 1-PCA scores are very similar between the suggest best k of 9 and 6. Hence for now we'll move on with a k of 6.
+
+```{r}
+#| fig-width: 15
+#| fig-height: 10
+#| fig-align: "center"
+
+
+collect_classes(prot.all.hamming_distance.cola.out, k = 6)
+```
+
+It is very encouraging that already from this heatmap it seems that pro-B ALL samples mainly fall into groups 4 and 5 which points towards true underlying biology driving this grouping.
+
+The righter most group 6 is still enriched for low quality samples (low number of passes) as are the first samples of the lefter most group. We can formalize this
+
+```{r}
+test_to_known_factors(prot.all.hamming_distance.cola.out["all:hclust_hamming"], k = 6) %>% 
+  t() %>% 
+  as_tibble(rownames = "metric") %>% 
+  rstatix::adjust_pvalue(p.col = "all:hclust_hamming")
+```
+
+However, we have very successfully removed viability and CD19 blast count as main drivers of clustering.
+
+# Cluster investigation
+
+## Signature proteins
+
+To infer the clustering, we first aim to define signature features for every group. For this, we start with a simple two step strategy. In the first step, we use a non-parametric kruskal wallis test to identify any feature that is different between any of the clusters (FDR \<1%)
+
+```{r}
+get_classes(prot.all.hamming_distance.cola.out["all:hclust_hamming"], k = 6) %>% 
+  as_tibble(rownames = "prot_id") %>% 
+  left_join(meta.all) -> meta.all
+
+meta.all %>% 
+  mutate(class = paste0("class_", class)) -> meta.all
+```
+
+```{r}
+
+prot.all %>% 
+  as_tibble(rownames = "uniprotid") %>%
+  #head() %>% 
+  pivot_longer(cols = -uniprotid, names_to = "prot_id", values_to = "intensities") %>% 
+  left_join(
+    dplyr::select(meta.all, prot_id, class)
+  ) %>% 
+  mutate(class = factor(class)) %>% 
+  group_by(uniprotid) %>% 
+  rstatix::kruskal_test(intensities ~ class) %>% 
+  rstatix::adjust_pvalue() %>% 
+  filter(p.adj < 0.01) -> sig_de_proteins
+```
+
+This leaves us with only a hand full of proteins significantly different between all the clusters. Now we can compare the expression of any of those genes for any of the clusters (one-vs-all).
+
+```{r}
+prot.all[sig_de_proteins$uniprotid, ] %>% 
+  as_tibble(rownames = "uniprotid") %>%
+  #head() %>% 
+  pivot_longer(cols = -uniprotid, names_to = "prot_id", values_to = "intensities") %>% 
+  left_join(
+    dplyr::select(meta.all, prot_id, class)
+  ) %>% 
+  mutate(class = factor(class)) %>% 
+  group_by(uniprotid) %>% 
+  rstatix::wilcox_test(intensities ~ class, ref.group = "all", detailed = T) %>% 
+  filter(p.adj < 0.01) -> sig_de_proteins_one_vs_all
+
+sig_de_proteins_one_vs_all %>% 
+  dplyr::select(uniprotid, group2, p.adj) %>% 
+  group_by(group2) %>% 
+  summarize(n_markergenes = n()) %>% 
+  dplyr::rename("cluster" = "group2")
+```
+
+As we can see, while clusters 1, 3 through 5 have a higher number of marker proteins, clusters 2 and 6 differ only by 2 and 8 proteins respectively.
+
+And plot the class-wise intensities for up to 10 proteins per class.
+
+```{r}
+#| fig-width: 17
+#| fig-height: 12
+#| fig-align: center
+#| column: screen-inset-shaded
+
+
+sig_de_proteins_one_vs_all %>% 
+  dplyr::select(uniprotid, group2, p.adj) %>% 
+  group_by(group2) %>% 
+  arrange(p.adj, .by_group = T) %>% 
+  slice_head(n = 10) -> sig_de_proteins_one_vs_all.top10
+
+sig_de_proteins_one_vs_all.top10 %>% 
+  group_by(uniprotid) %>% 
+  summarize(group2 = paste0(group2, collapse = ";")) -> sig_de_proteins_one_vs_all.top10.collapsed
+
+prot.all[sig_de_proteins_one_vs_all.top10$uniprotid, ] %>% 
+  as_tibble(rownames = "uniprotid") %>%
+  #head() %>% 
+  pivot_longer(cols = -uniprotid, names_to = "prot_id", values_to = "intensities") %>% 
+  left_join(dplyr::select(meta.all, prot_id, class)) %>% 
+  left_join(sig_de_proteins_one_vs_all.top10.collapsed) %>% 
+  dplyr::rename("from_group" = "group2") %>% 
+  mutate(class = as.factor(class),
+         uniprotid = ifelse(is.na(uniprotid_to_hgnc_symbol[uniprotid]), uniprotid,uniprotid_to_hgnc_symbol[uniprotid]))  %>% 
+  ggplot(aes(x=class, y = intensities, fill = ifelse(stringr::str_detect(from_group, as.character(class)), as.factor(class), NA_character_))) +
+  geom_violin() +
+  geom_point(position = position_jitter(width = 0.2)) +
+  facet_wrap(~ from_group + uniprotid, scale = "free", labeller = label_wrap_gen(multi_line = F)) +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() + 
+  theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1)) +
+  scale_x_discrete(labels = abbreviate)
+```
+
+For the interpretation we'll for now focus on the most upregulated proteins. We can identify those by using the pseudo-median estimate which is sign negative for up-regulated proteins
+
+With this information, we can try to infer some top-level biology
+
+### Cluster 1
+
+```{r}
+sig_de_proteins_one_vs_all %>%
+  filter(estimate < 0) %>% 
+  group_by(group2) %>% 
+  arrange(p.adj, .by_group = T) %>% 
+  mutate(symbol = uniprotid_to_hgnc_symbol[uniprotid]) %>% 
+  relocate(symbol, .after = uniprotid) %>% 
+  filter(!is.na(symbol)) %>% 
+  filter(group2 == "class_1") %>% 
+  ungroup() %>% 
+  dplyr::select(uniprotid, symbol, p.adj) %>% 
+  DT::datatable(filter = "top", 
+                options = list(autoWidth = F, scrollX = T), 
+                class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+Class 1 is the largest subgroup. We find some ubiquitine terms there (USP15, USP47, both ubiquitine hydrolases) and UBR4 (a E3 ligase). NCKAP1L is a hematopoietic specific regulator of actin cytoskeleton. RAB10 is a Ras-related protein which regulates intracellular membrane trafficking.
+
+### Cluster 2
+
+```{r}
+sig_de_proteins_one_vs_all %>%
+  filter(estimate < 0) %>% 
+  group_by(group2) %>% 
+  arrange(p.adj, .by_group = T) %>% 
+  mutate(symbol = uniprotid_to_hgnc_symbol[uniprotid]) %>% 
+  relocate(symbol, .after = uniprotid) %>% 
+  filter(!is.na(symbol)) %>% 
+  filter(group2 == "class_2") %>% 
+  ungroup() %>% 
+  dplyr::select(uniprotid, symbol, p.adj) %>% 
+  DT::datatable(filter = "top", 
+                options = list(autoWidth = F, scrollX = T), 
+                class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+This cluster only has 2 upregulated ribosomal proteins, RPL10 and RPLP2, both are part of the 60S large ribosomal subunit. However, of all clusters this one still has the strongest correlation with low quality sampels
+
+```{r}
+meta.all %>% 
+  ggplot(aes(x=factor(class == "class_2"), y = alive_cells_per_ml)) +
+  geom_boxplot() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  ggpubr::stat_compare_means() +
+  scale_y_log10() +
+  labs(x= "Class 2", y = "alive cells [ml]")
+```
+
+### Cluster 3
+
+```{r}
+sig_de_proteins_one_vs_all %>%
+  filter(estimate < 0) %>% 
+  group_by(group2) %>% 
+  arrange(p.adj, .by_group = T) %>% 
+  mutate(symbol = uniprotid_to_hgnc_symbol[uniprotid]) %>% 
+  relocate(symbol, .after = uniprotid) %>% 
+  filter(!is.na(symbol)) %>% 
+  filter(group2 == "class_3") %>% 
+  ungroup() %>% 
+  dplyr::select(uniprotid, symbol, p.adj) %>% 
+  DT::datatable(filter = "top", 
+                options = list(autoWidth = F, scrollX = T), 
+                class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+Enriched are members of the [SWI/SNF](https://en.wikipedia.org/wiki/SWI/SNF) chromatin remodeling complex whos decreased expression is described to be correlated with glucocorticoid resistance in ALL by [@pottier2008]. CD44, a surface marker involved in lymphocyte activation, is also up-regulated in this cluster. Lastly, IGF2BP2 is an IRF2-dependent transcriptional co-repressor. Cluster 3 has the strongest association with the pro-B subtype.
+
+```{r}
+table(factor(meta.all$class == "class_3"), meta.all$subtyp) %>% rstatix::fisher_test()
+```
+
+### Cluster 4
+
+```{r}
+sig_de_proteins_one_vs_all %>%
+  filter(estimate < 0) %>% 
+  group_by(group2) %>% 
+  arrange(p.adj, .by_group = T) %>% 
+  mutate(symbol = uniprotid_to_hgnc_symbol[uniprotid]) %>% 
+  relocate(symbol, .after = uniprotid) %>% 
+  filter(!is.na(symbol)) %>% 
+  filter(group2 == "class_4") %>% 
+  ungroup() %>% 
+  dplyr::select(uniprotid, symbol, p.adj) %>% 
+  DT::datatable(filter = "top", 
+                options = list(autoWidth = F, scrollX = T), 
+                class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+Cluster 4 is clearly enriched for ribosomal and additionally, some mitochondrial terms. It has the tightest structure of all clusters. This and also cluster 3 have the strongest association with pro-B subtype.
+
+### Cluster 5
+
+```{r}
+sig_de_proteins_one_vs_all %>%
+  filter(estimate < 0) %>% 
+  group_by(group2) %>% 
+  arrange(p.adj, .by_group = T) %>% 
+  mutate(symbol = uniprotid_to_hgnc_symbol[uniprotid]) %>% 
+  relocate(symbol, .after = uniprotid) %>% 
+  filter(!is.na(symbol)) %>% 
+  filter(group2 == "class_5") %>% 
+  ungroup() %>% 
+  dplyr::select(uniprotid, symbol, p.adj) %>% 
+  DT::datatable(filter = "top", 
+                options = list(autoWidth = F, scrollX = T), 
+                class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+### Cluster 6
+
+```{r}
+sig_de_proteins_one_vs_all %>%
+  filter(estimate < 0) %>% 
+  group_by(group2) %>% 
+  arrange(p.adj, .by_group = T) %>% 
+  mutate(symbol = uniprotid_to_hgnc_symbol[uniprotid]) %>% 
+  relocate(symbol, .after = uniprotid) %>% 
+  filter(!is.na(symbol)) %>% 
+  filter(group2 == "class_6") %>% 
+  ungroup() %>% 
+  dplyr::select(uniprotid, symbol, p.adj) %>% 
+  DT::datatable(filter = "top", 
+                options = list(autoWidth = F, scrollX = T), 
+                class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+## ORA
+
+Similarly, we can use linear models to identify significantly up-regulated features per class in a one vs all fashion and use these as an input for an over representation analysis (ORA). We input up-regulated features with an FDR \<1% and use the quantified proteome as the universe.
+
+### GO-terms
+
+```{r}
+#| fig-width: 15
+#| fig-height: 10
+#| fig-align: "center"
+
+lapply(unique(meta.all$class), FUN = 
+         function(n) {
+           batch <- colnames(prot.all) %in% meta.all[meta.all$class == n,]$prot_id
+           batch_mm <- model.matrix(~ 0 + as.factor(batch))
+           colnames(batch_mm) <- c("not_inclus", "inclus")
+           batch_cm <- limma::makeContrasts(inclus - not_inclus, levels = batch_mm)
+           limma::lmFit(prot.all, design = batch_mm) %>% 
+             limma::contrasts.fit(batch_cm) %>% 
+             limma::eBayes() %>% 
+             limma::topTable(number = Inf) %>% 
+             return()
+         }) -> sig_de_proteins_one_vs_all.limma
+
+sig_de_proteins_one_vs_all.limma %>% 
+  purrr::map(~ filter(., adj.P.Val <= 0.1 & logFC > 0) %>% 
+               rownames() %>% 
+               clusterProfiler::enrichGO(gene = ., 
+                                         OrgDb = "org.Hs.eg.db", #
+                                         keyType = "UNIPROT", 
+                                         minGSSize = 10, 
+                                         maxGSSize = 500, 
+                                         readable = T, 
+                                         universe = rownames(prot.all))) -> sig_de_proteins_one_vs_all.limma.enrichGO
+
+sig_de_proteins_one_vs_all.limma.enrichGO %>% 
+  purrr::map_df(~ as_tibble(.), .id = "cluster") %>% 
+  group_by(cluster) %>% 
+  arrange(p.adjust, .by_group = T) %>% 
+  slice_head(n = 5) %>% 
+  dplyr::select(cluster, Description, p.adjust, Count) %>% 
+  mutate(Description = tidytext::reorder_within(Description, by = -log(p.adjust), within = cluster, decreasing = T)) %>% 
+  ggplot(aes(x=Description, y = -log(p.adjust))) +
+  geom_point(aes(size = log10(Count))) +
+  geom_segment(aes(xend = Description, yend = 0)) + 
+  facet_grid(cluster ~ ., scale = "free_y", drop = T) +
+  coord_flip() +
+  tidytext::scale_x_reordered() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  labs(x="", y = "-log(adj. p-value)")
+```
+
+### Reactome terms
+
+```{r}
+#| fig-width: 15
+#| fig-height: 10
+#| fig-align: "center"
+
+
+lapply(unique(meta.all$class), FUN = 
+         function(n) {
+           batch <- colnames(prot.all) %in% meta.all[meta.all$class == n,]$prot_id
+           batch_mm <- model.matrix(~ 0 + as.factor(batch))
+           colnames(batch_mm) <- c("not_inclus", "inclus")
+           batch_cm <- limma::makeContrasts(inclus - not_inclus, levels = batch_mm)
+           limma::lmFit(prot.all, design = batch_mm) %>% 
+             limma::contrasts.fit(batch_cm) %>% 
+             limma::eBayes() %>% 
+             limma::topTable(number = Inf) %>% 
+             return()
+         }) -> sig_de_proteins_one_vs_all.limma
+
+sig_de_proteins_one_vs_all.limma %>% 
+  purrr::map(~ filter(., adj.P.Val <= 0.1 & logFC > 0) %>% 
+               rownames() %>% 
+               uniprotid_to_entrez[.] %>% 
+               ReactomePA::enrichPathway(gene = ., 
+                                         organism = "human",  
+                                         minGSSize = 10, 
+                                         maxGSSize = 500, 
+                                         readable = T, 
+                                         universe = na.omit(uniprotid_to_entrez[rownames(prot.all)]))) -> sig_de_proteins_one_vs_all.limma.reactome
+
+sig_de_proteins_one_vs_all.limma.reactome %>% 
+  purrr::map_df(~ as_tibble(.), .id = "cluster") %>% 
+  group_by(cluster) %>% 
+  arrange(p.adjust, .by_group = T) %>% 
+  slice_head(n = 5) %>% 
+  dplyr::select(cluster, Description, p.adjust, Count) %>% 
+  mutate(Description = stringr::str_remove(string = Description, pattern = "Homo sapiens\r: "),
+         Description = stringr::str_trunc(string = Description, side = "right", width = 50),
+    Description = tidytext::reorder_within(Description, by = -log(p.adjust), within = cluster, decreasing = T)) %>% 
+  ggplot(aes(x=Description, y = -log(p.adjust))) +
+  geom_point(aes(size = log10(Count))) +
+  geom_segment(aes(xend = Description, yend = 0)) + 
+  facet_grid(cluster ~ ., scale = "free_y", drop = T) +
+  coord_flip() +
+  tidytext::scale_x_reordered() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  labs(x="", y = "-log(adj. p-value)")
+```
+
+## Comparison of proteome to transcriptional signatures
+
+[@gu2019] describe a large scale gene expression analysis of nearly 2000 B-progenitor ALL samples from the St. Judes'/childrens cancer group (COG) cohort. Here, they define 23 distinct subtypes based on (cyto)genetic aberrations (e.g. ETV6-RUNX1 fusion, KMT2A rearrangements) and also gene expression signatures. Some of the subgroups were previously defined mainly based on genetic events. Clustering based on gene expression data identified 14 subgroups, two of which have alterations in PAX5 (PAX5alt and PAX5 P80R) which the went on to profile in depth. Furthermore, from the 23 initial groups, Ph and Ph-like merged into a common cluster as did samples of high hyperdiploidity and near haploitidy.
+
+Unfortunately, the intersect of transcripts and proteins identified in our data set is quite small. Still, we can get a reasonable number of up-regulated features per subgroup to use to define subtype-specific proteomic subsets. These subsets again can be used as input for gene set variation analysis (GSVA) where we get a sample-wise normalized enrichment score for any of the subgroup signatures.
+
+```{r}
+cog_rnaseq <- sapply(readxl::excel_sheets("Data/COG RNASeq/B-ALL-subtype-signature.xlsx")[3:16], FUN = function(i) readxl::read_excel(path = "Data/COG RNASeq/B-ALL-subtype-signature.xlsx", sheet = i), simplify = F, USE.NAMES = T)
+
+names(cog_rnaseq) <- janitor::make_clean_names(names(cog_rnaseq))
+
+cog_rnaseq %>% 
+  map_df(~ arrange(., desc(log2FoldChange)) %>% 
+           filter(log2FoldChange > 0 & padj < 0.01), .id = "subgroup") -> cog_rnaseq_topup
+
+clusterProfiler::bitr(geneID = cog_rnaseq_topup$geneName, fromType = "SYMBOL", toType = "UNIPROT", OrgDb = "org.Hs.eg.db") %>% distinct(SYMBOL, .keep_all = T) -> cog_symbol_to_uniprot
+
+cog_rnaseq_topup %>% 
+  left_join(cog_symbol_to_uniprot, by=c("geneName" = "SYMBOL")) %>% 
+  filter(!is.na(UNIPROT)) %>% 
+  filter(UNIPROT %in% rownames(prot.all)) %>% 
+  {
+    split(.$UNIPROT, .$subgroup)
+  } -> cog_subgroup_signatures
+```
+
+We can visualize the GSVA results in a simple heatmap and split the columns (=samples) based on the proteomic groupes that we derived from the community detection.
+
+```{r}
+GSVA::gsva(expr = prot.all, gset.idx.list = cog_subgroup_signatures) -> prot.all.cog_subgroups.gsva
+```
+
+```{r}
+#| fig-width: 15
+#| fig-height: 8
+#| fig-align: center
+
+
+prot.all.cog_subgroups.gsva %>% 
+  ComplexHeatmap::Heatmap(column_split = meta.all$class)
+```
+
+While the majority of transcriptomic groups does not align with proteomic clusters, cluster 3, which is also enriched for pro-B disease, is strongly correlated with a KMT2A-rearranged expression signature.
+
+In general, it seems that already from the very sparse proteomic signatures nearly all samples could be assigned to one distinct subgroup. We can test this hypothesis by first assigning each sample to the subtype with the highest GSVA score.
+
+```{r}
+prot.all.cog_subgroups.gsva %>% 
+  as_tibble(rownames = "subtype") %>% 
+  pivot_longer(cols = -subtype, names_to = "sample", values_to = "gsva_score") %>% 
+  group_by(sample) %>% 
+  arrange(desc(gsva_score), .by_group = T) %>% 
+  slice_head(n=1) %>% 
+  ggplot(aes(x=gsva_score)) +
+  geom_histogram(col = "black") +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border()
+```
+
+However, from the heatmap it is clear that for example samples in cluster 1 enrich in many different subtypes. To correct for this, we can for each score subtract the mean score (background score) to get a delta score and define a threshold. Assignments based on delta scores smaller than this threshold are assumed to be ambiguous.
+
+```{r}
+matrixStats::rowMeans2(t(prot.all.cog_subgroups.gsva), useNames = T) -> base_gsva_scores
+
+base_gsva_scores %>% 
+  as_tibble(rownames = "sampleid") %>% 
+  mutate(value = abs(value)) -> base_gsva_scores
+```
+
+```{r}
+prot.all.cog_subgroups.gsva %>% 
+  as_tibble(rownames = "subtype") %>% 
+  pivot_longer(cols = -subtype, names_to = "sample", values_to = "gsva_score") %>% 
+  left_join(base_gsva_scores, by=c("sample" = "sampleid")) %>% 
+  mutate(corrected_score = (abs(gsva_score) - value) * sign(gsva_score)) %>% 
+  group_by(sample) %>% 
+  arrange(desc(corrected_score)) %>% 
+  slice_head(n=1) %>% 
+  ggplot(aes(x=corrected_score)) +
+  geom_histogram(col = "black") +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  labs(x="delta score")
+```
+
+And now we define an arbitrary threshold for the delta score of 0.2. Samples with a delta score smaller than that are not assigned to any subtype, samples with a delta score higher than this are assigned to the cluster with the highest positive score.
+
+```{r}
+prot.all.cog_subgroups.gsva %>% 
+  as_tibble(rownames = "subtype") %>% 
+  pivot_longer(cols = -subtype, names_to = "sample", values_to = "gsva_score") %>% 
+  left_join(base_gsva_scores, by=c("sample" = "sampleid")) %>% 
+  mutate(corrected_score = (abs(gsva_score) - value) * sign(gsva_score)) %>% 
+  group_by(sample) %>% 
+  arrange(desc(corrected_score)) %>% 
+  slice_head(n=1) %>% 
+  mutate(subtype = case_when(corrected_score < 0.2 ~ NA_character_,
+                             TRUE ~ subtype)) -> prot.all.cog_subgroups.gsva.subtypes
+```
+
+```{r}
+table(is.na(prot.all.cog_subgroups.gsva.subtypes$subtype))
+```
+
+With this, we can assign 82 samples to a molecular subtype based on the proteome.
+
+```{r}
+meta.all$rnaseq_subtype <- prot.all.cog_subgroups.gsva.subtypes$subtype
+```
+
+To infer the statistical correlation between the proteomic clusters and the gene expression subtypes, we run a Fisher test for every 2x2 contingency table (in class vs no in class by in subgroup vs not in subgroup).
+
+```{r}
+give_all_tabs_per_class <- function(i) 
+{
+  sapply(na.omit(unique(meta.all$rnaseq_subtype)), FUN = function(ii) table(factor(meta.all$class == i), factor(meta.all$rnaseq_subtype == ii)) %>% rstatix::fisher_test(), USE.NAMES = T, simplify = F) %>% 
+    bind_rows(.id = "subgroup") %>% 
+    return()
+}
+
+sapply(unique(meta.all$class), FUN = give_all_tabs_per_class, simplify = F, USE.NAMES = T) %>% 
+  bind_rows(.id = "class") %>% 
+  rstatix::adjust_pvalue(p.col = "p") %>% 
+  rstatix::add_significance(p.col = "p.adj") %>% 
+  filter(p.adj <= 0.01)
+```
+
+When comparing all classes vs all subgroups and correcting for multiple testing, only the correlation between class 3 and the KMT2A rearranged subgroup remains statistically significant (which is also obvious from the heatmap).
+
+# Summary and outlook
+
+In this analysis we have used the normalized and filtered data set to I) detect community/clusters which are independent of identified technical covariates such as viability and blast count II) performed an in-depth analysis of proteomic features of the clusters and III) compared the proteomic clusters to signatures derived from gene expression data to infer molecular subtypes. We could show that while in general there's no overlap between proteomic clusters and subtypes based on gene expression, cluster 3 is in fact highly enriched for a signature found in KMT2A rearranged ALL. Furthermore, cluster 4 has a strong signal for ribosomal proteins which probably drives underlying biology.
+
+In the next step, a correlation with the clinical annotation is needed to I) assess the impact of proteomic cluster on clinical outcomes such as therapy response and long-term survival II) correlate the proteomic to cytogenetic data to confirm for example the KMT2A rearrangements in cluster 3 samples and to further inform the clusterings.
