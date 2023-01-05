@@ -738,7 +738,7 @@ cog_rnaseq_topup %>%
   } -> cog_subgroup_signatures
 ```
 
-We can visualize the GSVA results in a simple heatmap and split the columns (=samples) based on the proteomic groupes that we derived from the community detection.
+We can visualize the GSVA results in a simple heatmap and split the columns (=samples) based on the proteomic groups that we derived from the community detection.
 
 ```{r}
 GSVA::gsva(expr = prot.all, gset.idx.list = cog_subgroup_signatures) -> prot.all.cog_subgroups.gsva
@@ -819,7 +819,18 @@ table(is.na(prot.all.cog_subgroups.gsva.subtypes$subtype))
 With this, we can assign 82 samples to a molecular subtype based on the proteome.
 
 ```{r}
+#| fig-width: 13
+#| fig-height: 8
+
+
 meta.all$rnaseq_subtype <- prot.all.cog_subgroups.gsva.subtypes$subtype
+
+meta.all %>% 
+  dplyr::select(prot_id, class, rnaseq_subtype) %>% 
+  pivot_wider(id_cols = prot_id, names_from = rnaseq_subtype, values_from = rnaseq_subtype, values_fn = ~ ifelse(is.na(.), NA_integer_ ,1), values_fill = 0) %>% 
+  column_to_rownames("prot_id") %>% 
+  t() %>% 
+  ComplexHeatmap::Heatmap(column_split = meta.all$class, na_col = "white", col = circlize::colorRamp2(breaks = c(0,1), colors = c("lightgrey", "red")), show_row_dend = F, show_column_dend = F, rect_gp = grid::gpar(col = "white", lwd = 2), cluster_column_slices = F)
 ```
 
 To infer the statistical correlation between the proteomic clusters and the gene expression subtypes, we run a Fisher test for every 2x2 contingency table (in class vs no in class by in subgroup vs not in subgroup).
