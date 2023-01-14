@@ -1031,7 +1031,7 @@ prot.all.slc.irs.merge.filtered.10PCs %>%
   scale_color_viridis_c() +
   cowplot::theme_minimal_grid()+
   cowplot::panel_border() +
-  labs(x="PC1 scores",  y = "Viability") +
+  labs(x="PC1 scores",  y = "CD19 blast count") +
   stat_smooth(method = "lm") +
   ggpubr::stat_cor(method = "spearman")
 ```

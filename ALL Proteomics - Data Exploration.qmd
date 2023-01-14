@@ -38,6 +38,24 @@ colData(all.summarizedExperiment) %>%
   as_tibble(rownames = "prot_id") -> meta.all
 ```
 
+Furthermore, we have some limited molecular data stored in the meta data
+
+```{r}
+mol_group <- readxl::read_excel("Data/Metadata/ALLStudy1_Liste_total.xlsx", sheet = "AC_aufgetaut", skip = 3) %>% 
+  filter(LaufNr %in% meta.all$ID) %>% 
+  dplyr::select(LaufNr, MolGen) %>% 
+  mutate(MolGen = case_when(MolGen == 1 ~ "neg",
+                            MolGen == 3 ~ "KMT2A-AF4",
+                            MolGen == 5 ~ "cMyc", 
+                            MolGen == 6 ~ "KMT2A_others",
+                            TRUE ~ NA_character_)) %>% 
+  janitor::clean_names() %>% 
+  mutate(lauf_nr = as.numeric(lauf_nr)) -> mol_group
+
+meta.all %>% 
+  left_join(mol_group, by=c("ID" = "lauf_nr")) -> meta.all
+```
+
 ```{r}
 rownames(prot.all) %>% 
   clusterProfiler::bitr(fromType = "UNIPROT", toType = "SYMBOL", OrgDb = "org.Hs.eg.db") %>% 
@@ -66,7 +84,7 @@ We can visualize this dis-similarity matrix using a heatmap. Additionally, we ca
 
 vegan::vegdist(t(prot.all), method = "euclidean", binary = F, diag = T, upper = F, na.rm = T) -> prot.all.dist
 
-ComplexHeatmap::HeatmapAnnotation(df = as.data.frame(meta.all) %>% dplyr::select(subtyp, thawing_date:pass)) -> all.heatmap_annotation
+ComplexHeatmap::HeatmapAnnotation(df = as.data.frame(meta.all) %>% dplyr::select(subtyp, thawing_date:mol_gen)) -> all.heatmap_annotation
 
 prot.all.dist %>% 
   as.matrix() %>% 
@@ -730,12 +748,38 @@ cog_rnaseq %>%
 clusterProfiler::bitr(geneID = cog_rnaseq_topup$geneName, fromType = "SYMBOL", toType = "UNIPROT", OrgDb = "org.Hs.eg.db") %>% distinct(SYMBOL, .keep_all = T) -> cog_symbol_to_uniprot
 
 cog_rnaseq_topup %>% 
-  left_join(cog_symbol_to_uniprot, by=c("geneName" = "SYMBOL")) %>% 
+  left_join(cog_symbol_to_uniprot, by=c("geneName" = "SYMBOL")) -> cog_rnaseq_topup 
+
+cog_rnaseq_topup %>% 
   filter(!is.na(UNIPROT)) %>% 
   filter(UNIPROT %in% rownames(prot.all)) %>% 
   {
     split(.$UNIPROT, .$subgroup)
   } -> cog_subgroup_signatures
+```
+
+To get a feeling for the proteomic recoverage of the gene expression-derived sets we can quantify the fraction of features that are re-identified in the proteome \[%\].
+
+```{r}
+cog_rnaseq_topup  %>% 
+  {
+    split(.$UNIPROT, .$subgroup)
+  } %>% 
+  map(~ . %in% rownames(prot.all) %>% table()) %>% 
+  bind_rows(.id = "subtype") %>% 
+  dplyr::rename("recovered" = "TRUE", "not_recovered" = "FALSE") %>% 
+  mutate(recovered_percent = round(recovered/(recovered + not_recovered) * 100, 2)) %>% 
+  DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+Furthermore, we can list for every subgroup the recovered proteins used for identification.
+
+```{r}
+cog_rnaseq_topup %>% 
+  filter(!is.na(UNIPROT)) %>% 
+  filter(UNIPROT %in% rownames(prot.all)) %>% 
+  dplyr::select(subgroup, geneName, log2FoldChange) %>% 
+  DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
 ```
 
 We can visualize the GSVA results in a simple heatmap and split the columns (=samples) based on the proteomic groups that we derived from the community detection.
@@ -825,12 +869,18 @@ With this, we can assign 82 samples to a molecular subtype based on the proteome
 
 meta.all$rnaseq_subtype <- prot.all.cog_subgroups.gsva.subtypes$subtype
 
+heatmap_rnasubtype_topann <- ComplexHeatmap::HeatmapAnnotation(df = meta.all$mol_gen, col = list("df" = c("KMT2A-AF4" = "red", "KMT2A_others" = "red", "neg" = "white")))
+
 meta.all %>% 
   dplyr::select(prot_id, class, rnaseq_subtype) %>% 
   pivot_wider(id_cols = prot_id, names_from = rnaseq_subtype, values_from = rnaseq_subtype, values_fn = ~ ifelse(is.na(.), NA_integer_ ,1), values_fill = 0) %>% 
   column_to_rownames("prot_id") %>% 
   t() %>% 
-  ComplexHeatmap::Heatmap(column_split = meta.all$class, na_col = "white", col = circlize::colorRamp2(breaks = c(0,1), colors = c("lightgrey", "red")), show_row_dend = F, show_column_dend = F, rect_gp = grid::gpar(col = "white", lwd = 2), cluster_column_slices = F)
+  ComplexHeatmap::Heatmap(column_split = meta.all$class, na_col = "white", col = circlize::colorRamp2(breaks = c(0,1), colors = c("lightgrey", "red")), show_row_dend = F, show_column_dend = F, rect_gp = grid::gpar(col = "white", lwd = 2), cluster_column_slices = F, top_annotation = heatmap_rnasubtype_topann, show_column_names = F)
+```
+
+```{r}
+table(factor(meta.all$rnaseq_subtype == "kmt2a"), factor(meta.all$mol_gen)) %>% fisher.test()
 ```
 
 To infer the statistical correlation between the proteomic clusters and the gene expression subtypes, we run a Fisher test for every 2x2 contingency table (in class vs no in class by in subgroup vs not in subgroup).
@@ -851,6 +901,26 @@ sapply(unique(meta.all$class), FUN = give_all_tabs_per_class, simplify = F, USE.
 ```
 
 When comparing all classes vs all subgroups and correcting for multiple testing, only the correlation between class 3 and the KMT2A rearranged subgroup remains statistically significant (which is also obvious from the heatmap).
+
+To answer why particularly for KMT2A the proteomic signature works so well, we can quantify the mean importance of the features that are reidentified in the proteome per gene set
+
+```{r}
+cog_subgroup_signatures %>%
+  imap_dfr(~ as_tibble(.x) %>% 
+         bind_cols("subgroup" = .y) %>% 
+         left_join(cog_rnaseq_topup, by=c("value" = "UNIPROT", "subgroup"))) %>% 
+  mutate(subgroup = fct_reorder(subgroup, log2FoldChange, mean)) %>% 
+  ggplot(aes(x=subgroup, y = log2FoldChange, fill = subgroup)) +
+  geom_boxplot() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  labs(x="", y= "log2 FC") + 
+  coord_flip() + 
+  Seurat::NoLegend() +
+  scale_fill_viridis_d()
+```
+
+As expected, for the KMT2A group the mean importance of the reidentified proteomic features is higher compared to for example the BCL2 set.
 
 # Summary and outlook
 
