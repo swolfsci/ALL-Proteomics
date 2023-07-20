@@ -636,7 +636,7 @@ Similarly, we can use linear models to identify significantly up-regulated featu
 #| fig-height: 10
 #| fig-align: "center"
 
-lapply(unique(meta.all$class), FUN = 
+sapply(unique(meta.all$class), FUN = 
          function(n) {
            batch <- colnames(prot.all) %in% meta.all[meta.all$class == n,]$prot_id
            batch_mm <- model.matrix(~ 0 + as.factor(batch))
@@ -647,7 +647,7 @@ lapply(unique(meta.all$class), FUN =
              limma::eBayes() %>% 
              limma::topTable(number = Inf) %>% 
              return()
-         }) -> sig_de_proteins_one_vs_all.limma
+         }, simplify = F, USE.NAMES = T) -> sig_de_proteins_one_vs_all.limma
 
 sig_de_proteins_one_vs_all.limma %>% 
   purrr::map(~ filter(., adj.P.Val <= 0.1 & logFC > 0) %>% 
@@ -686,7 +686,7 @@ sig_de_proteins_one_vs_all.limma.enrichGO %>%
 #| fig-align: "center"
 
 
-lapply(unique(meta.all$class), FUN = 
+sapply(unique(meta.all$class), FUN = 
          function(n) {
            batch <- colnames(prot.all) %in% meta.all[meta.all$class == n,]$prot_id
            batch_mm <- model.matrix(~ 0 + as.factor(batch))
@@ -697,7 +697,7 @@ lapply(unique(meta.all$class), FUN =
              limma::eBayes() %>% 
              limma::topTable(number = Inf) %>% 
              return()
-         }) -> sig_de_proteins_one_vs_all.limma
+         }, simplify = F, USE.NAMES = T) -> sig_de_proteins_one_vs_all.limma
 
 sig_de_proteins_one_vs_all.limma %>% 
   purrr::map(~ filter(., adj.P.Val <= 0.1 & logFC > 0) %>% 
@@ -795,7 +795,7 @@ GSVA::gsva(expr = prot.all, gset.idx.list = cog_subgroup_signatures) -> prot.all
 
 
 prot.all.cog_subgroups.gsva %>% 
-  ComplexHeatmap::Heatmap(column_split = meta.all$class)
+  ComplexHeatmap::Heatmap(column_split = meta.all$class, show_column_names = F)
 ```
 
 While the majority of transcriptomic groups does not align with proteomic clusters, cluster 3, which is also enriched for pro-B disease, is strongly correlated with a KMT2A-rearranged expression signature.
@@ -879,11 +879,27 @@ meta.all %>%
   ComplexHeatmap::Heatmap(column_split = meta.all$class, na_col = "white", col = circlize::colorRamp2(breaks = c(0,1), colors = c("lightgrey", "red")), show_row_dend = F, show_column_dend = F, rect_gp = grid::gpar(col = "white", lwd = 2), cluster_column_slices = F, top_annotation = heatmap_rnasubtype_topann, show_column_names = F)
 ```
 
+We can quantify the statistical correlation between the RNAseq subgroup and the actual KMT2A sample status.
+
 ```{r}
 table(factor(meta.all$rnaseq_subtype == "kmt2a"), factor(meta.all$mol_gen)) %>% fisher.test()
 ```
 
-To infer the statistical correlation between the proteomic clusters and the gene expression subtypes, we run a Fisher test for every 2x2 contingency table (in class vs no in class by in subgroup vs not in subgroup).
+This confirms a significant statistical correlation. We can furthermore plot a ROC curve to quantify the sensitivity and specitifity using our proteomic classifier to identify true KMT2A r/r cases.
+
+```{r}
+tibble("kmt2a_score" = prot.all.cog_subgroups.gsva["kmt2a", ]) %>% 
+  bind_cols(kmt2a_class = meta.all$mol_gen) %>% 
+  mutate(kmt2a_class = ifelse(kmt2a_class == "neg", 0 , 1)) %>% 
+  {
+    pROC::roc(kmt2a_class ~ kmt2a_score, data = .)
+  } %>% pROC::plot.roc(print.thres = T, print.auc = T)
+  
+```
+
+As already judged from the heatmap, the AUC is quite good with a higher sensitivity (i.e. more true cases are detected) than specificity (KMT2A wt are correctly classified).
+
+To generalize the statistical correlation between any proteomic cluster and any RNA subtype, we run a Fisher test for every 2x2 contingency table (in class vs no in class by in subgroup vs not in subgroup).
 
 ```{r}
 give_all_tabs_per_class <- function(i) 
