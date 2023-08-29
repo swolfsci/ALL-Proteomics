@@ -1,5 +1,4 @@
 ---
-y(t)---
 title: "ALL_proteogenomics_maincohort"
 author: "Sebastian Wolf"
 format: html
@@ -803,22 +802,314 @@ prot_all %>%
   geom_point(size = 2) 
 ```
 
-### Cola
+### Consensus Clustering
 
 ```{r}
-library(cola)
+library(ConsensusClusterPlus)
+prot_all.mat <- as.matrix(column_to_rownames(prot_all, "gene_names")) 
 
-cola::adjust_matrix(as.matrix(column_to_rownames(prot_all, "gene_names"))) -> adjusted.matrix
+# DreamAI impute on cluster
+prot_all.mat.imp <- readRDS("prot_all.mat.imp.RDS")
+prot_all.mat.imp <- prot_all.mat.imp$Ensemble
+```
 
-cola::run_all_consensus_partition_methods(data = adjusted.matrix, top_value_method = all_top_value_methods(), partition_method = all_partition_methods(), max_k = 6, anno = sample_metadata %>% 
-  dplyr::select(Subtyp, Mat, Medium, viability_percentage_of_life_cels, CD45_dim_blasts, CD19_positive_blasts, RNA_seq) %>% 
-  as.data.frame(), verbose = T) -> cola.out
+```{r}
+library(umap)
+umap(t(prot_all.mat.imp)) -> umap.out
 
-cola_report(cola.out)
+umap.out$layout %>% 
+  as_tibble(rownames = "sample_id") %>% 
+  left_join(sample_metadata, by="sample_id") %>% 
+  ggplot(aes(x=molekularer_subtyp, y = V2)) +
+  geom_violin() +
+  ggpubr::stat_compare_means()
+```
 
-suggest_best_k(cola.out)
-collect_stats(cola.out[["CV:skmeans"]])
-collect_plots(cola.out[["CV:skmeans"]])
+### BayesNMF
+
+```{r}
+ccfindR::scNMFSet(prot_all.mat) -> prot_all.mat.scNMFSet
+set.seed(069)
+ccfindR::vb_factorize(object = prot_all.mat.scNMFSet, ranks = 2:6, nrun = 10, progress.bar = T)
+```
+
+### NMF clustering
+
+```{r}
+library(NMF)
+
+doParallel::registerDoParallel(cores = parallel::detectCores() - 1)
+# done on the cluster
+# the CPTAC single omics NMF clustering workflow as described here https://github.com/broadinstitute/PANOPLY/wiki/Data-Analysis-Modules%3A-panoply_so_nmf includes a row-wise z-scoring prior to clustering and the algorithm being used is "lee"
+# since z-scoring introduces negative values, we apply the transformation suggested by CPTAG
+# create a positive and negative values-only matrix with the signs removed and negative/positive values zeroed out
+# after NMF, recombine the final matrix with the sign matrix of the initial z-score matrix
+
+
+prot_all.mat.z_scored <- t(scale(t(prot_all.mat.imp)))
+make.non.negative(prot_all.mat.z_scored) -> prot_all.mat.z_scord_combined
+
+# run on cluster
+# nmf(x = prot_all.mat.z_scord_combined, rank = 2:10, method = "brunet", seed = 069, nrun = 200, .options ="pv", .pbackend = "par") -> nmf.out
+
+nmf.out <- readRDS("nmf.out.RDS")
+
+rank.coph <- sapply(nmf.out$consensus, NMF::cophcor)
+rank.disp <- sapply(nmf.out$consensus, NMF::dispersion)
+rank.coph.disp <- rank.disp^(1-rank.coph)
+
+GetBestRank(rank.coph.disp)
+
+# estimate best rank as 4 which is in line with the visual metrics
+# extract best rank 4
+
+res.rank <- nmf.out$fit[["4"]]
+
+# get cluster assignments
+clus.assignments <- predict(res.rank)
+
+
+```
+
+```{r}
+ComplexHeatmap::Heatmap(prot_all.mat.z_scored, column_split = clus.assignments)
+```
+
+We can now re-compute the feature matrix
+
+```{r}
+# meta feature matrix 
+W <- res.rank@fit@W
+
+colnames(W) <- 1:ncol(W)
+
+## row-normalize
+W.norm <- t(apply(W, 1,  function(x)x/sum(x)))
+
+## combine up/down: take highest normalized score
+feat.comb <- unique( sub('^(.*-.*)_(up|down)$' , '\\1', rownames(W.norm)) )
+
+W.norm.dir <- W.norm
+direction.tmp <- sub('.*_(.*)$', '\\1', rownames(W.norm.dir))
+
+## sign the coefficients
+direction.tmp[direction.tmp == 'down' ] <- -1
+direction.tmp[direction.tmp == 'up' ] <- 1
+direction.tmp <- as.numeric(direction.tmp)
+W.norm.dir <- direction.tmp*W.norm.dir
+
+
+```
+
+```{r}
+cores <- detectCores() - 1
+cl <- makeCluster(cores)
+registerDoParallel(cl)
+feat.comb <- stringr::str_remove_all(feat.comb, "_(up|down)")
+W.tmp2 <- foreach(i = 1:length(feat.comb)) %dopar% {
+  library(glue)
+  library(stringr)
+  ii=feat.comb[i]
+  idx.tmp <- grep(glue("^{ii}_(up|down)$"), rownames(W.norm))
+  W.tmp <- W.norm.dir[ idx.tmp, ]
+   ## if multiple rows were found, choose max of abs-val
+    if(length(idx.tmp) > 1){
+      W.tmp <- apply(W.tmp, 2, function(x) x[ which.max(abs(x)) ])
+    }
+  
+    W.tmp
+  }
+
+on.exit(stopCluster(cl))
+
+W.norm.comb <- Reduce(rbind, W.tmp2)
+dimnames(W.norm.comb) <- list(feat.comb, colnames(W))
+W.norm.comb <- W.norm.comb[seq(1, nrow(W.norm.comb), 2),]
+```
+
+And plot the samples in the NMF reduced space
+
+```{r}
+res.rank@fit@H %>% 
+  t() %>% 
+  umap::umap() -> umap.out
+
+umap.out$layout %>% 
+  as_tibble(rownames ="id") %>% 
+  bind_cols(classes = clus.assignments) %>% 
+  ggplot(aes(x=V1, y = V2, col = classes)) +
+  geom_point(size = 2)
+```
+
+```{r}
+# extract DE proteins using a one-vs-rest 2-sample moderated t-statistic 
+library(limma)
+
+mod.t <- function(m, group) {
+  group_vec <- as.numeric(clus.assignments == group)
+  mm <- model.matrix(~ 0 + factor(group_vec))
+  colnames(mm) <- c("rest", "one")
+  cm <- makeContrasts(one - rest, levels = mm)
+  lmFit(m, mm) %>% 
+    contrasts.fit(cm) %>% 
+    eBayes() %>% 
+    topTable(number = Inf, sort.by = "logFC")
+}
+
+sapply(as.character(1:4), mod.t, m = prot_all.mat, simplify = F) -> modt.out
+```
+
+```{r}
+library(clusterProfiler)
+
+enrich_clusters <- function(x) {
+  # rank by signed logFC * -log10(adj.p.val)
+  as_tibble(x, rownames = "gene") %>% 
+    mutate(order = logFC * -log10(adj.P.Val)) %>% 
+    dplyr::select(gene, order) %>% 
+    deframe() %>% 
+    sort(decreasing = T) %>% 
+    {
+      clusterProfiler::gseGO(geneList=., ont = "ALL", OrgDb = "org.Hs.eg.db", keyType = "SYMBOL",minGSSize = 10, maxGSSize = 500)
+    }
+}
+
+sapply(modt.out, enrich_clusters, simplify = F) -> gsea.out
+```
+
+```{r}
+# we use compare cluster with the universal GSEA function and the msigdb C5 as the gene set source
+msigdbr_c5 <- msigdbr::msigdbr(category = "C5")
+
+sapply(modt.out, function(x){
+  as_tibble(x, rownames = "gene") %>% 
+    mutate(order = logFC * -log10(adj.P.Val)) %>% 
+    dplyr::select(gene, order) %>% 
+    deframe() %>% 
+    sort(decreasing = T) }, simplify = F) %>% 
+  {
+    clusterProfiler::compareCluster(geneClusters = ., fun = "GSEA", TERM2GENE = dplyr::select(msigdbr_c5, gs_name, gene_symbol))
+  } -> comparecluster.gsea.out
+
+comparecluster.gsea.out %>% 
+  filter(NES >0) %>% 
+  mutate(GO = factor(stringr::str_extract(ID, "GOBP|GOCC|GOMF|HP"))) %>% 
+  dotplot()
+```
+
+```{r}
+# helper function from https://github.com/broadinstitute/PANOPLY/blob/dev/src/panoply_mo_nmf/mo-nmf.r
+
+make.non.negative <- function(m){
+
+  ## up
+  m.up <-  t( apply(m, 1, function(x){
+    up=rep(0, length(x))
+    up[which(x > 0)] <- x[which(x>0)]
+    up
+  }))
+  colnames(m.up) <- colnames(m)
+  rownames(m.up) <- paste(rownames(m), 'up', sep='_')
+  ## down
+  m.down <-  t( apply(m, 1, function(x){
+    down=rep(0, length(x))
+    down[which(x < 0)] <- abs(x[which(x<0)])
+    down
+  }))
+  colnames(m.down) <- colnames(m)
+  rownames(m.down) <- paste(rownames(m), 'down', sep='_')
+
+  ## combine
+  m.comb <- rbind(m.up, m.down)
+  m.comb <- m.comb[order(rownames(m.comb)),]
+
+  
+  ## remove rows only containing zero values
+  keep.idx <- which(apply(m.comb, 1, function(x) sum(x != 0) ) > 0)
+  m.comb <- m.comb[keep.idx, ]
+
+  return(m.comb)
+}
+```
+
+```{r}
+# helper function from https://github.com/broadinstitute/PANOPLY/blob/dev/src/panoply_mo_nmf/mo-nmf.r
+
+GetBestRank <- function(metric,       ## vector of a metric to assess clustering
+                        topn.rank=1,  ## Number of of top N ranks to return
+                        exclude_2=F,  ## should rank=2 be excluded?
+                        rel.inc=1e-6  ## stop criteria for relative increase from K to K+1
+                                      ## update to 1e-6 when applied to: rank.disp^(1-rank.coph)
+                        ){
+
+  ## https://stackoverflow.com/questions/6836409/finding-local-maxima-and-minima
+  # ## Answer #37
+  # localMaxima <- function(x) {
+  #   # Use -Inf instead if x is numeric (non-integer)
+  #   y <- diff(c(-.Machine$integer.max, x)) > 0L
+  #   rle(y)$lengths
+  #   y <- cumsum(rle(y)$lengths)
+  #   y <- y[seq.int(1L, length(y), 2L)]
+  #   if (x[[1]] == x[[2]]) {
+  #     y <- y[-1]
+  #   }
+  #   y
+  # }
+  #
+
+  if(exclude_2){
+     if('2' %in% names(metric))
+       metric <- metric[-which(names(metric) == '2')]
+  }
+
+  rank.top <- names(metric)[1]
+
+  success <- F
+  i <- 1
+  while(!success){
+
+    top_k <- metric[rank.top]
+    this_k <- metric[i]
+
+    ## last entry
+    if(i == length(metric)){
+      if(this_k > top_k){
+        
+        inc_perc <- (this_k - top_k)/abs(top_k)
+        if(inc_perc > rel.inc)
+          rank.top <- names(metric)[i]
+        }
+      success <- T
+    } else {
+
+      next_k <- metric[i+1]
+
+      if(next_k < this_k){
+          i <- i+1
+        }
+      if(next_k >= this_k){
+
+        if(next_k > top_k){
+          
+          ## percent increase 
+          inc_perc <- (next_k - top_k)/abs(top_k)
+
+          if(inc_perc < rel.inc){
+            success <- T
+          } else {
+            rank.top <- names(metric)[i + 1]
+            i <- i + 1
+
+            }
+        } else {
+          i <- i + 1
+        }
+      }
+    }
+  }
+
+  return(rank.top)
+}
 ```
 
 # Summary
