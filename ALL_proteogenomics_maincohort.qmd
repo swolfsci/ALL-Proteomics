@@ -887,7 +887,7 @@ colnames(W) <- 1:ncol(W)
 W.norm <- t(apply(W, 1,  function(x)x/sum(x)))
 
 ## combine up/down: take highest normalized score
-feat.comb <- unique( sub('^(.*-.*)_(up|down)$' , '\\1', rownames(W.norm)) )
+feat.comb <- unique( sub('^(.*)_(up|down)$' , '\\1', rownames(W.norm)) )
 
 W.norm.dir <- W.norm
 direction.tmp <- sub('.*_(.*)$', '\\1', rownames(W.norm.dir))
@@ -902,9 +902,12 @@ W.norm.dir <- direction.tmp*W.norm.dir
 ```
 
 ```{r}
-cores <- detectCores() - 1
-cl <- makeCluster(cores)
-registerDoParallel(cl)
+library(parallel)
+library(doParallel)
+
+#cores <- detectCores() - 1
+# cl <- makeCluster(cores)
+# registerDoParallel(cl)
 feat.comb <- stringr::str_remove_all(feat.comb, "_(up|down)")
 W.tmp2 <- foreach(i = 1:length(feat.comb)) %dopar% {
   library(glue)
@@ -920,11 +923,34 @@ W.tmp2 <- foreach(i = 1:length(feat.comb)) %dopar% {
     W.tmp
   }
 
-on.exit(stopCluster(cl))
+#on.exit(stopCluster(cl))
 
 W.norm.comb <- Reduce(rbind, W.tmp2)
 dimnames(W.norm.comb) <- list(feat.comb, colnames(W))
-W.norm.comb <- W.norm.comb[seq(1, nrow(W.norm.comb), 2),]
+#W.norm.comb <- W.norm.comb[seq(1, nrow(W.norm.comb), 2),]
+
+protein_clustering <- apply(W.norm.comb, 1, which.max)
+
+
+```
+
+```{r}
+
+heatmap_topann <- 
+ComplexHeatmap::HeatmapAnnotation(df = data.frame(subtyp = sample_metadata$Subtyp, mol_subtyp = sample_metadata$molekularer_subtyp), col = list(subtyp = c("prä-B/c" = "#ADD8E6", "pro-B" = "#8B0000"),
+                                                                                                                                                mol_subtyp = c("BCR::ABL1-like" = "#E57373", "TCF3::PBX1" = "#FFA726", "ZNF384" = "#FFF176", "DUX4" = "#81C784", "KMT2A" = "#64B5F6", "PAX5alt" = "#BA68C8", "PAX5 P80R" = "#FF8A80", "unassigned" = "#4DB6AC", "MEF2D" = "#A1887F")))
+
+col_range <- circlize::colorRamp2(breaks = c(-2,0,2),colors = c("#1d3557", "#a8dadc", "#e63946"))
+
+ComplexHeatmap::Heatmap(prot_all.mat.z_scored, row_split = protein_clustering, column_split = predict(res.rank), show_column_names = F, show_row_names = F, top_annotation = heatmap_topann, show_column_dend = T, show_row_dend = F, col = col_range) -> heatmap.out
+
+
+```
+
+```{r}
+pdf(file = "all_proteomics_heatmap2.pdf")
+heatmap.out
+dev.off()
 ```
 
 And plot the samples in the NMF reduced space
@@ -995,6 +1021,34 @@ comparecluster.gsea.out %>%
   filter(NES >0) %>% 
   mutate(GO = factor(stringr::str_extract(ID, "GOBP|GOCC|GOMF|HP"))) %>% 
   dotplot()
+```
+
+NMF features vs DE features
+
+```{r}
+as_tibble(modt.out[[3]], rownames = "gene") %>% 
+    mutate(order = logFC * -log10(adj.P.Val)) %>% 
+    dplyr::select(gene, order, logFC, adj.P.Val) %>% 
+  left_join(as_tibble(W.norm.comb[,3], rownames = "gene"), by="gene") %>% 
+  ggplot(aes(x=order, y = value)) +
+  geom_point() +
+  cowplot::theme_cowplot()
+
+as_tibble(modt.out[[3]], rownames = "gene") %>% 
+    mutate(order = logFC * -log10(adj.P.Val)) %>% 
+    dplyr::select(gene, order, logFC, adj.P.Val) %>% 
+  left_join(as_tibble(W.norm.comb[,3], rownames = "gene"), by="gene") %>% 
+  ggplot(aes(x=logFC, y = value)) +
+  geom_point() +
+  cowplot::theme_cowplot()
+
+as_tibble(modt.out[[3]], rownames = "gene") %>% 
+    mutate(order = logFC * -log10(adj.P.Val)) %>% 
+    dplyr::select(gene, order, logFC, adj.P.Val) %>% 
+  left_join(as_tibble(W.norm.comb[,3], rownames = "gene"), by="gene") %>% 
+  ggplot(aes(x=-log10(adj.P.Val), y = value)) +
+  geom_point() +
+  cowplot::theme_cowplot()
 ```
 
 ```{r}

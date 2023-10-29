@@ -5,3 +5,9 @@
 .httr-oauth
 .DS_Store
 .Rproj
+*.Rproj
+*.jpeg
+*.jpg
+*.pdf
+*.html
+*.pptx
