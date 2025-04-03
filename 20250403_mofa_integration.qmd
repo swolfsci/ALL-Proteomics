@@ -1,0 +1,213 @@
+---
+title: "MOFA integration"
+author: "Sebastian Wolf"
+format: html
+---
+
+# Model training
+
+We use the most variant 2k features from the protein and gene expression data and the mutation status to integrate into MOFA
+
+```{r}
+matrixStats::rowVars(as.matrix(all_proteomics_norm[, !stringr::str_detect(colnames(all_proteomics_norm), "is")]), na.rm =T) %>% 
+  as_tibble(rownames = "protein") %>% 
+  arrange(desc(value)) %>% 
+  head(n = 2000) %>% 
+  pull(protein) -> most_variable_proteins
+
+protein_view <- all_proteomics_norm[most_variable_proteins, !stringr::str_detect(colnames(all_proteomics_norm), "is")]
+
+matrixStats::rowVars(as.matrix(rna_counts_cpm_coding), na.rm =T) %>% 
+  as_tibble(rownames = "gene") %>% 
+  arrange(desc(value)) %>% 
+  head(n = 2000) %>% 
+  pull(gene) -> most_variable_genes
+
+rna_view <- rna_counts_cpm_coding[most_variable_genes, ]
+
+all_mutations %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(sample_id, matches("result|DNA")) %>% 
+  pivot_longer(
+    cols = matches("(_result|_dna)$"),
+    names_to = c("gene", ".value"),
+    names_pattern = "(.*)_(result|dna)"
+  ) %>% 
+  mutate(mutated=ifelse(result != "wild type", 1, 0),
+         sample_id = stringr::str_to_lower(sample_id), 
+         sample_id = ifelse(stringr::str_starts(sample_id, "d"), sample_id, paste0("x",sample_id))) %>% 
+  pivot_wider(id_cols = "gene", names_from = "sample_id", values_from = "mutated") %>% 
+  column_to_rownames("gene") -> mut_view
+```
+
+check the intersecting samplenames
+
+```{r}
+ggvenn::ggvenn(data = list("rna" = colnames(rna_view), "proteome" = colnames(protein_view), "mutation" = colnames(mut_view)))
+
+rna_view %>% 
+  as_tibble(rownames = "feature") %>% 
+  pivot_longer(cols = -feature, names_to = "sample", values_to = "value") %>% 
+  mutate(view = "rna") -> rna_view_long
+
+protein_view %>% 
+  as_tibble(rownames = "feature") %>% 
+  pivot_longer(cols = -feature, names_to = "sample", values_to = "value") %>% 
+  mutate(view = "proteome") -> proteome_view_long
+
+mut_view %>% 
+  as_tibble(rownames = "feature") %>% 
+  pivot_longer(cols = -feature, names_to = "sample", values_to = "value") %>% 
+  mutate(view = "mutation") -> mut_view_long
+
+mofa_data <- bind_rows(rna_view_long, proteome_view_long, mut_view_long) 
+```
+
+```{r}
+library(MOFA2)
+
+mofa_obj <- create_mofa(data = mofa_data)
+mofa_obj <- prepare_mofa(mofa_obj)
+mofa_trained <- run_mofa(mofa_obj, use_basilisk = T)
+
+allcatchr %>% 
+  dplyr::select(sample, Prediction, BlastCounts, Immuno) -> allcatchr_pred
+
+allcatchr %>% 
+  dplyr::select(sample, HSC:Most) %>% 
+  pivot_longer(cols = -sample, names_to = "ont", values_to ="score") %>% 
+  group_by(sample) %>% 
+  arrange(desc(score), .by_group = T) %>% 
+  slice_head(n=1) -> all_ont
+
+samples_metadata(mofa_trained) <- 
+  samples_metadata(mofa_trained) %>% 
+  left_join(allcatchr_pred, by=c("sample")) %>% 
+  left_join(all_ont) %>% 
+  mutate(Prediction = ifelse(stringr::str_starts(sample, "d"), "healthy_control", Prediction))
+
+plot_data_overview(mofa_obj)
+```
+
+## General exploration and model description
+
+```{r}
+mofa_trained <- run_umap(mofa_trained)
+
+plot_dimred(mofa_trained, "UMAP", color_by = "Prediction", show_missing = T, label = T, dot_size = 3)
+```
+
+```{r}
+plot_dimred(mofa_trained, "UMAP", color_by = "BlastCounts", show_missing = T, label = T, dot_size = 3)
+
+plot_dimred(mofa_trained, "UMAP", color_by = "Immuno", show_missing = T, label = T, dot_size = 3)
+
+plot_dimred(mofa_trained, "UMAP", color_by = "ont", show_missing = T, label = T, dot_size = 3)
+```
+
+## Factor investigations
+
+### Factor 1
+
+```{r}
+my_colors <- c(
+  "#E41A1C",  # Red
+  "#377EB8",  # Blue
+  "#4DAF4A",  # Green
+  "#984EA3",  # Purple
+  "#FF7F00",  # Orange
+  "#FFFF33",  # Yellow
+  "#A65628",  # Brown
+  "#F781BF",  # Pink
+  "#999999",  # Gray
+  "#66C2A5",  # Teal
+  "#FC8D62",  # Coral
+  "#8DA0CB",  # Periwinkle
+  "#E78AC3",  # Rose
+  "#A6D854",
+  "#FFD92F"# Lime green
+)
+
+get_factors(mofa_trained)$single_group %>% 
+  as_tibble(rownames = "sample") %>% 
+  left_join(allcatchr_pred, by=c("sample" = "sample_merge")) %>%
+  mutate(Prediction = ifelse(stringr::str_starts(sample, "d"), "healthy control", Prediction)) %>% 
+  ggplot(aes(Factor1, Factor2, col = Prediction)) + 
+  geom_point(size = 3) + 
+  cowplot::theme_cowplot() +
+  scale_color_manual(values = my_colors)
+
+get_factors(mofa_trained)$single_group %>% 
+  as_tibble(rownames = "sample") %>% 
+  left_join(all_ont, by=c("sample")) %>% 
+  ggplot(aes(Factor1, Factor2, col = ont)) + 
+  geom_point(size = 3) + 
+  cowplot::theme_cowplot() 
+```
+
+```{r}
+# we build binary matrices for other interesting GO/REACTOME terms
+
+library(msigdbr)
+library(msigdbdf)
+
+create_bin_matrix <- function(x) {
+  msig <- if(x[["subcat"]] == "") {
+    msigdbr::msigdbr(category = x[["cat"]])
+  } else {
+    msigdbr::msigdbr(category = x[["cat"]], subcategory = x[["subcat"]])
+  }
+  
+  msig %>% 
+  distinct(gs_name, gene_symbol) %>%
+  mutate(contained = 1) %>% 
+  pivot_wider(id_cols = "gs_name", 
+              values_from = "contained", 
+              names_from = "gene_symbol", 
+              values_fill = 0)  %>% 
+  column_to_rownames("gs_name") %>% 
+  as.matrix() 
+}
+
+go_binaries <- list("cc" = c(cat = "C5", subcat = "GO:CC"),
+                    "bp" = c(cat = "C5", subcat = "GO:BP"), 
+                    "mf" = c(cat = "C5", subcat = "GO:MF"),
+                    "reactome" = c(cat = "C2", subcat = "CP:REACTOME"),
+                    "h" = c(cat = "H", subcat = ""),
+                    "immunesigdb" = c(cat = "C7", subcat = "IMMUNESIGDB"))
+
+MSigDB_binaries <- lapply(go_binaries, create_bin_matrix)
+
+# also include the human mitocarta
+
+mitocarta <- readxl::read_excel("Data/Human.MitoCarta3.0.xls", sheet = "C MitoPathways") %>% janitor::clean_names()
+
+mitocarta_binary <- mitocarta %>% 
+  dplyr::select(mito_pathway, genes) %>% 
+  filter(!is.na(mito_pathway)) %>% 
+  nest_by(mito_pathway) %>% 
+  mutate(data = stringr::str_split(data, ",")) %>% 
+  unnest_longer(data) %>% 
+  mutate(data = stringr::str_trim(data, side = "both")) %>% 
+  distinct(mito_pathway, data) %>% 
+  mutate(contains = 1) %>% 
+  pivot_wider(id_cols = mito_pathway, values_from = contains, names_from = data, values_fill = 0) %>% 
+  column_to_rownames("mito_pathway") %>% 
+  as.matrix()
+
+MSigDB_binaries$mitocarta <- mitocarta_binary
+```
+
+```{r}
+mofa_enrichment_parametric_proteomics_up <- map(MSigDB_binaries, ~ run_enrichment(mofa_trained, view = "proteome", feature.sets = ., sign = "positive", statistical.test = "parametric"))
+
+mofa_enrichment_parametric_proteomics_down <- map(MSigDB_binaries, ~ run_enrichment(mofa_trained, view = "proteome", feature.sets = ., sign = "negative", statistical.test = "parametric"))
+
+mofa_enrichment_parametric_rna_up <- map(MSigDB_binaries, ~ run_enrichment(mofa_trained, view = "rna", feature.sets = ., sign = "positive", statistical.test = "parametric"))
+
+mofa_enrichment_parametric_rna_down <- map(MSigDB_binaries, ~ run_enrichment(mofa_trained, view = "rna", feature.sets = ., sign = "negative", statistical.test = "parametric"))
+```
+
+```{r}
+
+```

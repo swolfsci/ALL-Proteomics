@@ -17,8 +17,6 @@ rna_counts <- read_tsv("Data/Genomics/RNAseq/merged_counts.tsv") %>%
 
 rna_counts <- rna_counts %>% 
   dplyr::select(genes:"d703324202617")
-
-
 ```
 
 we use edgeR to perform standard QC and library size normalization
@@ -51,15 +49,43 @@ rna_counts_dgelist <- normLibSizes(rna_counts_dgelist, )
 rna_counts_cpm <- cpm(rna_counts_dgelist, normalized.lib.sizes = T, log = T, prior.count = 2)
 ```
 
+```{r}
+mart <- biomaRt::useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", mirror = "www")
+
+biomaRt::getBM(mart = mart, values = rownames(rna_counts_cpm), filters = "ensembl_gene_id", attributes = c("ensembl_gene_id", "hgnc_symbol"), verbose = T, useCache = T) -> biomart.out
+
+biomart.out %>% 
+  distinct(ensembl_gene_id, .keep_all = T) %>% 
+  mutate(hgnc_symbol = ifelse(hgnc_symbol == "", NA_character_, stringr::str_trim(hgnc_symbol, side = "both"))) -> biomart.out
+
+# and filter on the coding genome
+rna_counts_cpm %>% 
+  as_tibble(rownames = "ensemblid") %>% 
+  left_join(biomart.out, by=c("ensemblid" = "ensembl_gene_id"), na_matches = "never") %>% 
+  filter(!is.na(hgnc_symbol)) %>% 
+  slice_head(n=1, by = hgnc_symbol) %>% 
+  dplyr::select(-ensemblid) %>% 
+  column_to_rownames("hgnc_symbol") -> rna_counts_cpm_coding
+```
+
 we also include the ALLcatchR predictions
 
 ```{r}
-allcatchr <- read_tsv("Data/Genomics/RNAseq/merged_allcatchr_predictions.tsv")
+allcatchr <- read_tsv("../Data/Genomics/RNAseq/merged_allcatchr_predictions.tsv")
 
 allcatchr %>% 
   filter(!stringr::str_detect(sample, "MV4|SEM")) %>% 
   mutate(sample = readr::parse_number(sample)) %>% 
-  left_join(masterfile_ac, by=c("sample" = "bm_nr")) -> allcatchr
+  left_join(masterfile_ac, by=c("sample" = "bm_nr")) %>% 
+  mutate(sample = as.character(sample)) -> allcatchr
+
+allcatchr[allcatchr$sample == "70324302750" & allcatchr$Score == 0.5, ]$sample <- "70324302750_f02"
+
+allcatchr %>% 
+  mutate(sample = 
+           ifelse(stringr::str_starts(sample, "703"), 
+                  paste0("d", sample),
+                  paste0("x", sample))) -> allcatchr
 ```
 
 ```{r}
@@ -89,11 +115,7 @@ rna_counts_cpm %>%
   pcaMethods::pca() %>% 
   pcaMethods::scores() %>% 
   as_tibble(rownames = "samples") %>% 
-  mutate(samples = stringr::str_remove_all(samples, "x"),
-         samples = stringr::str_remove_all(samples, "d"),
-         samples = readr::parse_number(samples),
-         samples = as.numeric(samples)) %>% 
-  left_join(allcatchr, by=c("samples" = "sample")) %>% 
+    left_join(allcatchr, by=c("samples" = "sample")) %>% 
   mutate(Prediction = case_when(cohort == "healty_donor" ~ "healthy_donor",
                                 Confidence == "unclassified" ~ "unclassified",
                                 TRUE ~ Prediction)) %>%  

@@ -1,0 +1,151 @@
+---
+title: "ALL Proteomics processing and EDA"
+author: "Sebastian Wolf"
+format: html
+---
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+all_proteomics <- readxl::read_excel("Data/Proteomics/20250318_all_proteomics_astral_complete_run/2025-04-01_Cremer_ALL_Consensus_complete_renamed_not_normalized.xlsx")
+
+all_proteomics %>% 
+  janitor::clean_names() -> all_proteomics
+```
+
+retrieve the gene symbols for feature ID
+
+```{r}
+all_proteomics %>% 
+  dplyr::select(accession, description) %>% 
+  mutate(gene_name = stringr::str_extract(description, "(?<=GN\\=).*(?=PE)"),
+         gene_name = stringr::str_trim(gene_name, side = "both"), 
+         protein_name = stringr::str_extract(description, ".*(?=OS)"),
+         protein_name = stringr::str_trim(protein_name, side = "both")) -> protein_gene_names_metaframe
+
+all_proteomics %>% 
+  dplyr::select(starts_with("is"), starts_with("x"), starts_with("d"), -description) %>% 
+  bind_cols(gene_name = protein_gene_names_metaframe$gene_name) %>% 
+  pivot_longer(cols = -gene_name, names_to = "sample", values_to = "int") %>% 
+  filter(!is.na(gene_name)) %>% 
+  summarize(int = median(int, na.rm = T), .by = c(gene_name, sample)) %>% 
+  pivot_wider(id_cols = gene_name, names_from = "sample", values_from = "int") %>% 
+  column_to_rownames("gene_name") -> all_proteomics
+```
+
+visualize and merge the replicates
+
+```{r}
+all_proteomics[!rownames(all_proteomics) %in% high_missing_proteins, ] %>% 
+  as.matrix() %>% 
+  t() %>% 
+  pcaMethods::pca() %>% 
+  pcaMethods::scores() %>% 
+  as_tibble(rownames = "sample") %>% 
+  mutate(base_sample = ifelse(stringr::str_starts(sample, "is"), sample, stringr::str_remove_all(sample, "_r\\d"))) %>% 
+  ggplot(aes(PC1, PC2, col = base_sample)) + 
+  geom_point(size = 2) +
+  geom_line(aes(group = base_sample)) + 
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none")
+
+all_proteomics %>% 
+  as_tibble(rownames = "gene_name") %>% 
+  pivot_longer(cols = -gene_name, names_to = "sample", values_to = "int") %>% 
+  mutate(base_sample = ifelse(stringr::str_starts(sample, "is"), sample, stringr::str_remove_all(sample, "_r\\d"))) %>% 
+  summarize(int = median(int, na.rm = T), .by = c(gene_name, base_sample)) %>% 
+  pivot_wider(id_cols = gene_name, names_from = "base_sample", values_from = "int") %>% 
+  column_to_rownames("gene_name") -> all_proteomics
+```
+
+remove any samples or proteins with \>50% missing values
+
+```{r}
+matrixStats::rowSums2(is.na(all_proteomics)) %>% 
+  as_tibble(rownames = "protein") %>% 
+  mutate(value = value/ncol(all_proteomics) * 100) %>% 
+  arrange(desc(value)) %>% 
+  filter(value >= 50) %>% 
+  pull(protein) -> high_missing_proteins
+
+matrixStats::colSums2(is.na(all_proteomics)) %>% 
+  as_tibble(rownames = "sample") %>% 
+  mutate(value = value/nrow(all_proteomics) * 100) %>% 
+  arrange(desc(value)) %>% 
+  filter(value >= 50) %>% 
+  pull(sample) -> high_missing_sample
+
+all_proteomics[!rownames(all_proteomics) %in% high_missing_proteins, !colnames(all_proteomics) %in% high_missing_sample] -> all_proteomics
+```
+
+we normalize to the median summed intensity of the entire experiment and the median intensities of the internal standards to account for time-dependent shift
+
+```{r}
+# calculate the target size
+matrixStats::colSums2(as.matrix(all_proteomics), na.rm = T) %>% 
+  median() -> target_size
+
+# calculate the correction factors
+corr_factors <- target_size/matrixStats::colSums2(as.matrix(all_proteomics), na.rm = T)
+
+# apply the correction
+all_proteomics_sln <- sweep(all_proteomics, 2, corr_factors, "*")
+
+# calculate the target medians
+is_samples <- stringr::str_detect(colnames(all_proteomics_sln), "is")
+target_median <- median(as.matrix(all_proteomics_sln)[, is_samples], na.rm = T)
+
+corr_factors_median <- target_median/matrixStats::colMedians(as.matrix(all_proteomics_sln), na.rm = T)
+
+all_proteomics_norm <- sweep(all_proteomics_sln, 2, corr_factors_median, "*")
+```
+
+visualize the consequences of normalization
+
+```{r}
+all_proteomics %>% 
+  as_tibble(rownames = "gene_name") %>% 
+  pivot_longer(cols = -gene_name, names_to = "sample", values_to = "int") %>% 
+  ggplot(aes(int, col = sample)) + 
+  geom_density() +
+  scale_x_log10() + 
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none") -> non_normalized_proteome.plot 
+
+all_proteomics_sln %>% 
+  as_tibble(rownames = "gene_name") %>% 
+  pivot_longer(cols = -gene_name, names_to = "sample", values_to = "int") %>% 
+  ggplot(aes(int, col = sample)) + 
+  geom_density() +
+  scale_x_log10() + 
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none") -> sl_normalized_proteome.plot 
+
+all_proteomics_norm %>% 
+  as_tibble(rownames = "gene_name") %>% 
+  pivot_longer(cols = -gene_name, names_to = "sample", values_to = "int") %>% 
+  ggplot(aes(int, col = sample)) + 
+  geom_density() +
+  scale_x_log10() + 
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none") -> sl_and_median_normalized_proteome.plot 
+
+median_to_pc1 <- function(data) {
+  matrixStats::colMedians(as.matrix(data), na.rm = T) -> medians
+  pcaMethods::pca(t(data)) %>% 
+    pcaMethods::scores() %>% 
+    as_tibble(rownames = "sample") %>% 
+    bind_cols("medians" = medians) %>% 
+    {
+      lm(PC1 ~ medians,.)
+    } %>% 
+    summary() %>% 
+    .$r.squared
+  }
+```
+
+```{r}
+all_proteomics_norm <- log2(all_proteomics_norm)
+```
