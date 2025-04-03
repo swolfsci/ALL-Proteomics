@@ -107,8 +107,6 @@ plot_dimred(mofa_trained, "UMAP", color_by = "ont", show_missing = T, label = T,
 
 ## Factor investigations
 
-### Factor 1
-
 ```{r}
 my_colors <- c(
   "#E41A1C",  # Red
@@ -196,6 +194,18 @@ mitocarta_binary <- mitocarta %>%
   as.matrix()
 
 MSigDB_binaries$mitocarta <- mitocarta_binary
+
+signature_db <- readxl::read_excel("Data/SignatureDB_annotation_012422.xlsx")
+
+signature_db %>% 
+  janitor::clean_names() -> signature_db
+
+signature_db %>% 
+  pivot_wider(id_cols = signature, names_from = gene_symbol, values_from = gene_symbol, values_fn = ~ ifelse(is.na(.), 0, 1), values_fill = 0) %>% 
+  column_to_rownames("signature") %>% 
+  as.matrix() -> signature_binary_mat
+
+MSigDB_binaries$signature_db <- signature_binary_mat
 ```
 
 ```{r}
@@ -208,6 +218,187 @@ mofa_enrichment_parametric_rna_up <- map(MSigDB_binaries, ~ run_enrichment(mofa_
 mofa_enrichment_parametric_rna_down <- map(MSigDB_binaries, ~ run_enrichment(mofa_trained, view = "rna", feature.sets = ., sign = "negative", statistical.test = "parametric"))
 ```
 
-```{r}
+### Factor 1
 
+Clearly, factor 1 distinguished between healthy and B-ALL samples
+
+```{r}
+plot_factor(mofa_trained, factor = 1, color_by = "Prediction")
+```
+
+```{r}
+plot_factors(mofa_trained, factor = 1:2, color_by = "Prediction", dot_size = 2, show_missing = T)
+```
+
+healthy controls have high factor 1 scores, thus we need to look at the "down" enrichments to learn about the ALL samples
+
+```{r}
+plot_enrichment(mofa_enrichment_parametric_proteomics_down$mitocarta, factor = 1)
+```
+
+```{r}
+plot_enrichment(mofa_enrichment_parametric_rna_down$mf, factor = 1)
+```
+
+### Factor 2
+
+```{r}
+plot_factor(mofa_trained, factor = 2, color_by = "Prediction")
+```
+
+```{r}
+plot_enrichment(mofa_enrichment_parametric_proteomics_up$mf, factor = 2)
+```
+
+```{r}
+get_weights(mofa_trained, view = "proteome", factor = 2)$proteome %>% 
+  as_tibble(rownames = "protein") %>% 
+  arrange(desc(Factor2))
+```
+
+Clearly factor 2 identifies KMT2A-rearranged B-ALL. Notably, there are no enriched terms neither on protein nor gene expression level. We perform a standard DE expression analysis and compare the protein and gene overlap
+
+```{r}
+library(limma)
+
+allcatchr_pred %>% 
+  filter(Prediction == "KMT2A") %>% 
+  pull(sample) -> kmt2a_samples
+
+
+tibble(sample = colnames(all_proteomics_norm)) %>% 
+  mutate(kmt2a = sample %in% kmt2a_samples) -> kmt2a_vector
+
+mm <- model.matrix(~ 0 + kmt2a, data = kmt2a_vector)
+colnames(mm) <- c("other", "kmt2a")
+cm <- makeContrasts(kmt2a - other, levels = mm)
+
+all_proteomics_norm %>% 
+  limma::lmFit(mm) %>% 
+  limma::contrasts.fit(cm) %>% 
+  limma::eBayes() %>% 
+  limma::topTable(number = Inf) %>% 
+  as_tibble(rownames = "protein") %>% 
+  mutate(rank = sign(logFC) * -log10(adj.P.Val)) -> kmt2a_de_proteins
+
+kmt2a_de_proteins %>% 
+  mutate(label = ifelse(-log10(adj.P.Val) > -log10(0.05) & abs(logFC) > 1, protein, NA_character_)) %>% 
+  ggplot(aes(logFC, -log10(adj.P.Val), label = label)) + 
+  geom_point(size = 2) +
+  geom_hline(yintercept = -log10(0.05)) + 
+  geom_vline(xintercept = c(-1,1)) +
+  cowplot::theme_cowplot() +
+  ggrepel::geom_text_repel() + 
+  ggtitle("DE proteins")
+```
+
+```{r}
+allcatchr_pred %>% 
+  filter(Prediction == "KMT2A") %>% 
+  pull(sample) -> kmt2a_samples
+
+
+tibble(sample = colnames(rna_counts_cpm_coding)) %>% 
+  mutate(kmt2a = sample %in% kmt2a_samples) -> kmt2a_vector
+
+mm <- model.matrix(~ 0 + kmt2a, data = kmt2a_vector)
+colnames(mm) <- c("other", "kmt2a")
+cm <- makeContrasts(kmt2a - other, levels = mm)
+
+rna_counts_cpm_coding %>% 
+  limma::lmFit(mm) %>% 
+  limma::contrasts.fit(cm) %>% 
+  limma::eBayes() %>% 
+  limma::topTable(number = Inf) %>% 
+  as_tibble(rownames = "gene") %>% 
+  mutate(rank = sign(logFC) * -log10(adj.P.Val)) -> kmt2a_de_genes
+
+kmt2a_de_genes %>% 
+  mutate(label = ifelse(-log10(adj.P.Val) > -log10(0.05) & abs(logFC) > 1, gene, NA_character_)) %>% 
+  ggplot(aes(logFC, -log10(adj.P.Val), label = label)) + 
+  geom_point(size = 2) +
+  geom_hline(yintercept = -log10(0.05)) + 
+  geom_vline(xintercept = c(-1,1)) +
+  cowplot::theme_cowplot() +
+  ggrepel::geom_text_repel() + 
+  ggtitle("DE genes")
+```
+
+```{r}
+ggvenn::ggvenn(data = list("protein" = kmt2a_de_proteins[kmt2a_de_proteins$logFC>0 & kmt2a_de_proteins$adj.P.Val <= 0.1, ]$protein, gene = kmt2a_de_genes[kmt2a_de_genes$logFC>0 & kmt2a_de_genes$adj.P.Val <= 0.1, ]$gene))
+```
+
+```{r}
+kmt2a_de_genes[, c("gene", "rank")] %>% 
+  inner_join(kmt2a_de_proteins[, c("protein", "rank")], by=c("gene" = "protein")) %>% 
+  dplyr::rename("rank_gene" = "rank.x", "rank_protein" = "rank.y") %>% 
+  ggplot(aes(rank_gene, rank_protein)) + 
+  geom_point() + 
+  stat_smooth(method = "lm") + 
+  ggpubr::stat_cor() +
+  cowplot::theme_cowplot()
+```
+
+```{r}
+library(clusterProfiler)
+
+kmt2a_de_proteins[, c("protein", "rank")] %>% 
+  deframe() %>% 
+  sort(decreasing = T) -> kmt2a_ranked_proteins
+
+gseGO(kmt2a_ranked_proteins, ont = "ALL", OrgDb = "org.Hs.eg.db", minGSSize = 10, maxGSSize = 500, keyType = "SYMBOL") -> kmt2a_de_proteins.gsego
+
+kmt2a_de_genes[, c("gene", "rank")] %>% 
+  deframe() %>% 
+  sort(decreasing = T) -> kmt2a_ranked_genes
+
+gseGO(kmt2a_ranked_genes, ont = "ALL", OrgDb = "org.Hs.eg.db", minGSSize = 10, maxGSSize = 500, keyType = "SYMBOL") -> kmt2a_de_genes.gsego
+
+signature_db %>% 
+  dplyr::select(signature, gene_symbol) %>% 
+  dplyr::rename("term" = "signature", "gene" = "gene_symbol") -> signature_db_t2g
+
+GSEA(kmt2a_ranked_proteins, TERM2GENE = signature_db_t2g) -> kmt2a_ranked_proteins.gse_signature
+
+GSEA(kmt2a_ranked_genes, TERM2GENE = signature_db_t2g) -> kmt2a_ranked_genes.gse_signature
+```
+
+```{r}
+library(enrichplot)
+
+kmt2a_de_proteins.gsego %>%
+  filter(ONTOLOGY== "CC") %>% 
+  as_tibble() %>% 
+  mutate(rank2 = sign(NES) * -log10(p.adjust)) %>% 
+  arrange(desc(rank2)) %>% 
+  dplyr::select(Description, core_enrichment, rank2) 
+
+kmt2a_de_proteins.gsego %>%
+  filter(ONTOLOGY== "CC" & NES > 0) %>% 
+  enrichplot::dotplot(showCategory = 15) +
+  ggtitle("CC up in KMT2A")
+
+kmt2a_de_proteins.gsego %>%
+  filter(ONTOLOGY== "BP") %>% 
+  as_tibble() %>% 
+  mutate(rank2 = sign(NES) * -log10(p.adjust)) %>% 
+  arrange(desc(rank2)) %>% 
+  dplyr::select(Description, core_enrichment, rank2) 
+
+kmt2a_de_proteins.gsego %>%
+  filter(ONTOLOGY== "BP" & NES > 0) %>% 
+  enrichplot::dotplot(showCategory = 15) +
+  ggtitle("BP up in KMT2A")
+
+kmt2a_de_proteins.gsego %>%
+  filter(ONTOLOGY== "MF") %>% 
+  as_tibble() %>% 
+  mutate(rank2 = sign(NES) * -log10(p.adjust)) %>% 
+  arrange(desc(rank2)) %>% 
+  dplyr::select(Description, core_enrichment, rank2) 
+
+kmt2a_de_proteins.gsego %>%
+  filter(ONTOLOGY== "MF" & NES > 0) %>% 
+  enrichplot::dotplot(showCategory = 15) +
+  ggtitle("MF up in KMT2A")
 ```
