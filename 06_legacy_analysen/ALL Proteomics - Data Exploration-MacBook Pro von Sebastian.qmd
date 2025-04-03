@@ -943,3 +943,94 @@ As expected, for the KMT2A group the mean importance of the reidentified proteom
 In this analysis we have used the normalized and filtered data set to I) detect community/clusters which are independent of identified technical covariates such as viability and blast count II) performed an in-depth analysis of proteomic features of the clusters and III) compared the proteomic clusters to signatures derived from gene expression data to infer molecular subtypes. We could show that while in general there's no overlap between proteomic clusters and subtypes based on gene expression, cluster 3 is in fact highly enriched for a signature found in KMT2A rearranged ALL. Furthermore, cluster 4 has a strong signal for ribosomal proteins which probably drives underlying biology.
 
 In the next step, a correlation with the clinical annotation is needed to I) assess the impact of proteomic cluster on clinical outcomes such as therapy response and long-term survival II) correlate the proteomic to cytogenetic data to confirm for example the KMT2A rearrangements in cluster 3 samples and to further inform the clusterings.
+
+# Amend 02/2025
+
+Investigate correlation heatmap with Cluster 3 proteins
+
+```{r}
+sig_de_proteins_one_vs_all %>%
+  filter(estimate < 0) %>% 
+  group_by(group2) %>% 
+  arrange(p.adj, .by_group = T) %>% 
+  mutate(symbol = uniprotid_to_hgnc_symbol[uniprotid]) %>% 
+  relocate(symbol, .after = uniprotid) %>% 
+  filter(!is.na(symbol)) %>% 
+  filter(group2 == "class_3") %>% 
+  ungroup() %>% 
+  dplyr::select(uniprotid, symbol, p.adj)  -> class_3_proteins
+```
+
+```{r}
+cor_map <- cor(t(prot.all), use = "pairwise.complete.obs")
+
+hist(cor_map)
+
+
+
+hgnc_symbol_to_uniprotid[c("SMARCA4", "SMARCC2", "SMARCD1", "SMARCA5", "SMARCC1", "SMARCB1", "SMARCD2", "SMARCD3", "SMARCD1", "SMARCA2", "SMARCA1", "SMARCAL1", "ARID1A", "ARID1B", "ACTL6A", "ACTL6B", "SMARCE1")] %>% na.omit() -> swi_snf
+
+
+map(swi_snf, ~ abs(cor_map[.,]) %>% 
+      sort(decreasing = T) %>% 
+      head(n = 10) %>% 
+      names()) %>% 
+  unlist() %>% 
+  unique() -> correlated_proteins
+
+cor_map_adj <- cor_map[correlated_proteins, correlated_proteins]
+
+setnames <- as.vector(uniprotid_to_hgnc_symbol[colnames(cor_map_adj)])
+
+cor_map_adj <- magrittr::set_colnames(cor_map_adj, setnames)
+
+cor_map_adj <- magrittr::set_rownames(cor_map_adj, setnames)
+
+non_na_proteins <- na.omit(colnames(cor_map_adj))
+
+cor_map_adj <- cor_map_adj[non_na_proteins, non_na_proteins]
+
+cor_map_adj[abs(cor_map_adj) < 0.5] <- 0
+
+swi_snf <- c("SMARCA4", "SMARCC2", "SMARCD1", "SMARCA5", "SMARCC1", "SMARCB1", "SMARCD2", "SMARCD3", "SMARCD1", "SMARCA2", "SMARCA1", "SMARCAL1", "ARID1A", "ARID1B", "ACTL6A", "ACTL6B", "SMARCE1")
+
+tibble("name" = colnames(cor_map_adj)) %>% 
+  mutate(val = ifelse(name %in% swi_snf, "#CA6702", "#E9D8A6")) %>% 
+  pull(val) -> col_vec
+
+g <- igraph::graph_from_adjacency_matrix(cor_map_adj, mode = "undirected", weighted = T, diag = F)
+
+
+pdf(file = "smarc_correlation_network.pdf", width = 25, height = 25)
+igraph::plot.igraph(g, vertex.size = 5, edge.width = 1.3, vertex.color = col_vec, margin = 0, frame.width = 3, edge.color = "lightgrey")
+dev.off()
+```
+
+```{r}
+st_judes_mut <- readxl::read_excel("C:/Users/wolf-/Downloads/41588_2022_1159_MOESM4_ESM.xlsx", sheet = "SuppTable3_SnvIndel", skip = 3)
+
+st_judes_mut %>% 
+  filter(stringr::str_detect(Gene_VEP, "SMARC")) %>% 
+  dplyr::select(PatientID, Gene_VEP, Class_VEP) %>% 
+  summarize(n(), .by=c(Gene_VEP, Class_VEP)) %>% 
+  arrange(Gene_VEP, Class_VEP)
+
+col <- list("silent" = "#005F73",
+            "missense" = "#0A9396",
+            "proteinIns" = "#E9D8A6",
+            "splice_region" = "#EE9B00",
+            "splice" = "#CA6702",
+            "frameshift" = "#9B2226",
+            "UTR_3" = "#94D2BD")
+
+pdf(file = "smarc_mutation_heatmap.pdf", width = 8, height = 6)
+st_judes_mut %>% 
+  filter(stringr::str_detect(Gene_VEP, "SMARC")) %>% 
+  dplyr::select(PatientID, Gene_VEP, Class_VEP) %>% 
+  distinct(PatientID, Gene_VEP, .keep_all = T) %>% 
+  pivot_wider(names_from = "Gene_VEP", values_from = "Class_VEP") %>% 
+  column_to_rownames("PatientID") %>% 
+  as.matrix() %>% 
+  ComplexHeatmap::Heatmap(show_row_names = F, col = col, na_col = "#EAEAEA")
+dev.off()
+```

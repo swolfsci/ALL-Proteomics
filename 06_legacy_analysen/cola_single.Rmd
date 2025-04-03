@@ -1,0 +1,277 @@
+cola Report for Consensus Partitioning (SD:skmeans)
+==================
+
+**Date**: `r format(as.POSIXlt(Sys.time()), usetz = TRUE)`, **cola version**: `r installed.packages()["cola", "Version"]`
+
+----------------------------------------------------------------
+
+<style type='text/css'>
+
+body, td, th {
+   font-family: Arial,Helvetica,sans-serif;
+   background-color: white;
+   font-size: 13px;
+  max-width: 800px;
+  margin: auto;
+  margin-left:210px;
+  padding: 0px 10px 0px 10px;
+  border-left: 1px solid #EEEEEE;
+  line-height: 150%;
+}
+
+tt, code, pre {
+   font-family: 'DejaVu Sans Mono', 'Droid Sans Mono', 'Lucida Console', Consolas, Monaco, 
+
+monospace;
+}
+
+h1 {
+   font-size:2.2em;
+   line-height:150%;
+}
+
+h2 {
+   font-size:1.8em;
+}
+
+h3 {
+   font-size:1.4em;
+}
+
+h4 {
+   font-size:1.0em;
+}
+
+h5 {
+   font-size:0.9em;
+}
+
+h6 {
+   font-size:0.8em;
+}
+
+a {
+  text-decoration: none;
+  color: #0366d6;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+a:visited {
+   color: #0366d6;
+}
+
+pre, img {
+  max-width: 100%;
+}
+pre {
+  overflow-x: auto;
+}
+pre code {
+   display: block; padding: 0.5em;
+}
+
+code {
+  font-size: 92%;
+  border: 1px solid #ccc;
+}
+
+code[class] {
+  background-color: #F8F8F8;
+}
+
+table, td, th {
+  border: 1px solid #ccc;
+}
+
+blockquote {
+   color:#666666;
+   margin:0;
+   padding-left: 1em;
+   border-left: 0.5em #EEE solid;
+}
+
+hr {
+   height: 0px;
+   border-bottom: none;
+   border-top-width: thin;
+   border-top-style: dotted;
+   border-top-color: #999999;
+}
+
+@media print {
+   * {
+      background: transparent !important;
+      color: black !important;
+      filter:none !important;
+      -ms-filter: none !important;
+   }
+
+   body {
+      font-size:12pt;
+      max-width:100%;
+   }
+
+   a, a:visited {
+      text-decoration: underline;
+   }
+
+   hr {
+      visibility: hidden;
+      page-break-before: always;
+   }
+
+   pre, blockquote {
+      padding-right: 1em;
+      page-break-inside: avoid;
+   }
+
+   tr, img {
+      page-break-inside: avoid;
+   }
+
+   img {
+      max-width: 100% !important;
+   }
+
+   @page :left {
+      margin: 15mm 20mm 15mm 10mm;
+   }
+
+   @page :right {
+      margin: 15mm 10mm 15mm 20mm;
+   }
+
+   p, h2, h3 {
+      orphans: 3; widows: 3;
+   }
+
+   h2, h3 {
+      page-break-after: avoid;
+   }
+}
+</style>
+
+```{r, echo = FALSE, message = NA}
+library(knitr)
+library(markdown)
+options(width = 100)
+options(digits = 3)
+opts_chunk$set(
+    comment = "#>",
+    fig.path = "figure_cola/",
+    warning = FALSE,
+    message = FALSE
+)
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(genefilter))
+ht_opt$message = FALSE
+
+n_cores = get_nc(cores)
+```
+
+
+## Summary
+
+
+
+First the variable is renamed to `res`.
+
+```{r, eval = FALSE, echo = TRUE}
+res = cola.out["SD:skmeans"]
+```
+
+```{r, echo = FALSE}
+res = object
+```
+
+Dimension of the input matrix:
+
+```{r}
+mat = get_matrix(res)
+dim(mat)
+```
+
+Top-value method used:
+
+```{r}
+res@top_value_method
+```
+
+Partitioning method used:
+
+```{r}
+res@partition_method
+```
+
+The density distribution for each sample is visualized as in one column in the
+following heatmap. The clustering is based on the distance which is the
+Kolmogorov-Smirnov statistic between two distributions.
+
+```{r, echo = FALSE, message = NA}
+t1 = Sys.time()
+message(qq("* making density heatmap of global distribution for each sample (@{ncol(mat)} samples)"), appendLF = FALSE)
+```
+
+```{r density-heatmap}
+library(ComplexHeatmap)
+densityHeatmap(mat, top_annotation = HeatmapAnnotation(df = get_anno(res), 
+    col = get_anno_col(res)), ylab = "value", cluster_columns = TRUE, show_column_names = FALSE,
+    mc.cores = 1)
+```
+
+```{r, echo = FALSE, message = NA}
+t2 = Sys.time(); message(paste0(", ", gsub("^ +", "", format(t2 - t1))))
+```
+
+ 
+## Results
+
+```{r, results = "asis", echo = FALSE}
+fs = min(c(3*1, 14))/1
+
+is_hc = FALSE
+node = NULL
+single_report = TRUE
+
+all_k = res@k
+
+i_section = 1
+n_section = 1
+top_value_method = res@top_value_method
+partition_method = res@partition_method
+
+tmpfile = tempfile(tmpdir = cola:::.ENV$TEMP_DIR)
+
+brew(file.path(cola:::TEMPLATE_DIR, "section_template.Rmd-template"), tmpfile)
+rmd = paste(readLines(tmpfile), collapse = "\n")
+invisible(file.remove(tmpfile))
+
+ComplexHeatmap:::dev.null()
+txt = knit(text = rmd, quiet = TRUE)
+devlt = dev.list()
+if(names(devlt)[1] == "quartz_off_screen") {
+	invisible(dev.off())
+}
+invisible(dev.off())
+cat(txt, "\n")
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```
+
+```{r, echo = FALSE, message = NA}
+message("-----------------------------------------------------------------")
+```
+
+
+<script type="text/javascript">
+$(function() {
+    $("#TOC > ul > li > a").remove();
+}); 
+</script>

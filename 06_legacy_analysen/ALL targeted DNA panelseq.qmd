@@ -1,0 +1,87 @@
+---
+title: "ALL targeted DNA panel"
+author: "Sebastian Wolf"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(ComplexHeatmap)
+```
+
+We first visualize the results with a OncoPrint
+
+```{r}
+all_mutations <- readxl::read_excel("Data/Genomics/DNA targeted panel seq/20241216_ALL_data.xlsx", sheet = "Mutation matrix")
+
+col <- c("delIns" = "#66C2A5", "dup" = "#FC8D62", "ins" = "#8DA0CB", "snv" = "#E78AC3", "del" = "#A6D854")
+
+alter_fun = list(
+    background = alter_graphic("rect", fill = "#CCCCCC"),   
+    delIns = alter_graphic("rect", fill = col["delIns"]),
+    dup = alter_graphic("rect", fill = col["dup"]),
+    ins = alter_graphic("rect", fill = col["ins"]),
+    snv = alter_graphic("rect", fill = col["snv"]),
+    del = alter_graphic("rect", fill = col["del"])
+)
+
+all_mutations %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(sample_id, matches("result|DNA")) %>% 
+  pivot_longer(
+    cols = matches("(_result|_dna)$"),
+    names_to = c("gene", ".value"),
+    names_pattern = "(.*)_(result|dna)"
+  ) %>% 
+  mutate(result = case_when(result == "wild type" ~ "wild type", 
+                            is.na(result) ~ NA_character_,
+                            TRUE ~ "mutated"),
+         type = case_when(stringr::str_detect(dna, "delins") ~ "delIns",
+                          stringr::str_detect(dna, "del") ~ "del", 
+                          stringr::str_detect(dna, "dup") ~ "dup",
+                          stringr::str_detect(dna, "ins") ~ "ins",
+                          is.na(dna) ~ NA_character_, 
+                          TRUE ~ "snv")) %>% 
+  pivot_wider(id_cols = sample_id, names_from = gene, values_from = type) %>% 
+  column_to_rownames("sample_id") %>% 
+  rename_with(~ stringr::str_to_upper(.)) %>% 
+  as.matrix() %>% 
+  t() %>% 
+  oncoPrint(alter_fun = alter_fun, col = col, show_row_names = T, remove_empty_columns = T, remove_empty_rows = T) %>% 
+  draw() -> all_oncoprint
+```
+
+```{r}
+pdf(file = "all_oncoprint.pdf")
+all_oncoprint
+dev.off()
+```
+
+And compare the results from the sequencing to that of the RNA-based hotspot calls
+
+```{r}
+all_hotspot_predictions <- read_csv("../Data/Genomics/RNAseq/merged_hotspot_calls.csv")
+
+all_hotspot_predictions %>% 
+  filter(!stringr::str_detect(sample,"MV4-11")) %>% 
+  mutate(sample = paste0("bioid_", sample)) -> all_hotspot_predictions
+
+all_hotspot_predictions %>% 
+  dplyr::select(sample, Gene, Hotspot) %>% 
+  mutate(variant = T,
+         Gene = stringr::str_to_lower(Gene)) -> all_hotspot_predictions_df
+
+all_mutations %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(sample_id, matches("result|DNA")) %>% 
+  pivot_longer(
+    cols = matches("(_result|_dna)$"),
+    names_to = c("gene", ".value"),
+    names_pattern = "(.*)_(result|dna)"
+  ) %>% 
+  mutate(sample_id = paste0("bioid_", sample_id)) %>% 
+  left_join(all_hotspot_predictions_df, by=c("sample_id" = "sample", "gene" = "Gene")) %>% 
+  filter(result == "mutated" | variant) -> joined_mutations_hotspot_df
+```
+
+We can analyse the sensitivity and specificity of the RNA-based hotspot calling vs. the mutation sequencing - RNA hotspot calling only identifies variants in PAX5, NRAS, KRAS, ZEB2, FLT3

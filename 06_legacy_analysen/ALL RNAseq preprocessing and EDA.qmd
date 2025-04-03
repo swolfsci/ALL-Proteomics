@@ -1,0 +1,106 @@
+---
+title: "ALL cohort RNAseq"
+author: "Sebastian Wolf"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(edgeR)
+```
+
+there are two healthy donors named "xx50_E02" and "xx50_F02" whereas "70324221535" is missing
+
+```{r}
+rna_counts <- read_tsv("Data/Genomics/RNAseq/merged_counts.tsv") %>% 
+  janitor::clean_names()
+
+rna_counts <- rna_counts %>% 
+  dplyr::select(genes:"d703324202617")
+
+
+```
+
+we use edgeR to perform standard QC and library size normalization
+
+```{r}
+rna_counts <- column_to_rownames(rna_counts, "genes") %>% 
+  as.matrix()
+
+# check if any NA rows
+rna_counts %>% 
+  matrixStats::rowAnyNAs() -> na_vec
+
+rna_counts <- rna_counts[!na_vec,]
+
+# check if any NA cols
+
+rna_counts %>% 
+  matrixStats::colAnyNAs() %>% any()
+
+rna_counts_dgelist <- DGEList(rna_counts)
+keep <- filterByExpr(rna_counts_dgelist)
+
+rna_counts_dgelist <- rna_counts_dgelist[keep, , keep.lib.sizes = F]
+rna_counts_dgelist <- normLibSizes(rna_counts_dgelist, )
+
+#plotMDS(rna_counts_dgelist)
+
+# extract the log2 transformed, size normalized cpms with a prior count (psedo count) added of 2
+
+rna_counts_cpm <- cpm(rna_counts_dgelist, normalized.lib.sizes = T, log = T, prior.count = 2)
+```
+
+we also include the ALLcatchR predictions
+
+```{r}
+allcatchr <- read_tsv("Data/Genomics/RNAseq/merged_allcatchr_predictions.tsv")
+
+allcatchr %>% 
+  filter(!stringr::str_detect(sample, "MV4|SEM")) %>% 
+  mutate(sample = readr::parse_number(sample)) %>% 
+  left_join(masterfile_ac, by=c("sample" = "bm_nr")) -> allcatchr
+```
+
+```{r}
+# Adding a bright cyan color to the palette
+colors_15_improved <- c(
+  "#FF5733", # Bright Red-Orange
+  "#33FF57", # Bright Green
+  "#3357FF", # Bright Blue
+  "#FF33A1", # Bright Pink
+  "#FFC733", # Bright Yellow
+  "#57FF33", # Neon Green
+  "#FF33FF", # Bright Magenta (Replaces Bright Purple)
+  "#33FFF0", # Bright Aqua
+  "#FF8033", # Bright Orange
+  "#FF3333", # Bright Scarlet
+  "#33FF80", # Bright Mint
+  "#0099FF", # Bright Sky Blue (Replaces Bright Violet)
+  "#F0FF33", # Bright Lime
+  "#00AAFF", # Cyan-Blue
+  "#FF66CC"  # Bright Coral Pink
+)
+
+
+
+rna_counts_cpm %>% 
+  t() %>% 
+  pcaMethods::pca() %>% 
+  pcaMethods::scores() %>% 
+  as_tibble(rownames = "samples") %>% 
+  mutate(samples = stringr::str_remove_all(samples, "x"),
+         samples = stringr::str_remove_all(samples, "d"),
+         samples = readr::parse_number(samples),
+         samples = as.numeric(samples)) %>% 
+  left_join(allcatchr, by=c("samples" = "sample")) %>% 
+  mutate(Prediction = case_when(cohort == "healty_donor" ~ "healthy_donor",
+                                Confidence == "unclassified" ~ "unclassified",
+                                TRUE ~ Prediction)) %>%  
+  ggplot(aes(x=PC1, y = PC2, col = Prediction)) +
+  geom_point(size = 2) +
+  cowplot::theme_cowplot() +
+  scale_discrete_manual(values = colors_15_improved, aesthetics = "col") -> rna_pca_plot
+
+#ggsave(rna_pca_plot, filename = "rna_pca_plot.pdf", device = "pdf", width = 1.7*6, height = 6)
+```

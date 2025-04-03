@@ -1,0 +1,339 @@
+---
+title: "cohort III proteomics"
+author: "Sebastian Wolf"
+format: html
+---
+
+This is the preprocessing for the cohort III
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+cohort_III_metadata <- readxl::read_excel("Data/Proteomics/cremer_all_proteomics_cohortIII/cohort_III_metadata.xlsx") %>% 
+  janitor::clean_names() %>% 
+  mutate(sample = as.numeric(sample)) %>% 
+  left_join(dplyr::select(masterfile_ac, bm_nr, lab_id), by=c("sample" = "bm_nr"))
+
+```
+
+The data set includes `r nrow(cohort_III_metadata)` observations from `r unique(cohort_III_metadata$lab_id) %>% length()` unique patients. 
+
+```{r}
+# load the data
+cohort_III_proteomics <- readxl::read_excel("Data/Proteomics/cremer_all_proteomics_cohortIII/cohort_III_proteomics.xlsx") %>% 
+  janitor::clean_names(parsing_option = 3) 
+
+# correct the uniprot_ids and gene names, remove the maxquant metadata
+cohort_III_proteomics %>% 
+  mutate(across(.cols = c(uniprot_ids, gene_names), ~ 
+                  stringr::str_extract(., ".*?(?<=(;|$))") %>% 
+                  stringr::str_remove_all(";"))) %>% 
+  rename_with(.cols = starts_with("reporter_intensity_corrected"), ~ stringr::str_remove_all(.,"reporter_intensity_corrected_")) %>% 
+  dplyr::select(uniprot_ids:`10_r2_297`) -> cohort_III_proteomics
+
+# try to identify additional gene names
+cohort_III_proteomics %>% 
+  filter(is.na(gene_names)) %>% 
+  pull(uniprot_ids) %>% 
+  biomaRt::getBM(values = ., attributes = c("uniprotswissprot", "hgnc_symbol"), filters = c("uniprotswissprot"), useCache = T, mart =  biomaRt::useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", mirror = "www")) -> biomart_out
+
+cohort_III_proteomics[cohort_III_proteomics$uniprot_ids == "P0DOY3",]$gene_names <- "IGLC3"
+cohort_III_proteomics[cohort_III_proteomics$uniprot_ids == "P0DTL6",]$gene_names <- "ZFTRAF1"
+
+cohort_III_proteomics %>% 
+  filter(!is.na(gene_names)) -> cohort_III_proteomics
+
+# rest is unreviewd A0A annotations that we remove
+```
+
+```{r}
+# some HLA A have multiple measurements, we aggregate these
+cohort_III_proteomics %>% 
+  dplyr::select(-uniprot_ids) %>% 
+  pivot_longer(cols = -gene_names) %>% 
+  summarize(value = mean(value, na.rm = T), .by=c(gene_names, name)) %>% 
+  pivot_wider(id_cols = gene_names, values_from = "value", names_from = "name") -> cohort_III_proteomics
+```
+
+```{r}
+cohort_III_proteomics %>% 
+  pivot_longer(cols = -gene_names) %>% 
+  mutate(value = log2(value),
+         name = as.factor(name),
+         plex = stringr::str_extract(name, "_\\d{1,3}$")) %>% 
+  ggplot(aes(x=name, y = value, fill = plex)) + 
+  geom_boxplot(outlier.colour = NA) +
+  cowplot::theme_cowplot() +
+  theme(axis.text.x = element_blank()) +
+  ylim(c(10,20))
+  
+```
+There appears to be some plex-dependent variation
+
+```{r}
+cohort_III_proteomics %>% 
+  pivot_longer(cols = -gene_names) %>% 
+  mutate(value = log2(value),
+         name = as.factor(name),
+         plex = stringr::str_extract(name, "_\\d{1,3}$")) %>% 
+  #summarize(value = mean(value, na.rm = T), .by=c(plex)) %>% 
+  mutate(plex = as.factor(plex)) %>% 
+  ggplot(aes(x=plex, y = value, fill = plex)) +
+  geom_boxplot() +
+  ggpubr::stat_compare_means()
+```
+
+
+and also a substantial difference in the rates of missing values
+
+```{r}
+matrixStats::colSums2(is.na(cohort_III_proteomics)) %>% 
+  as_tibble(rownames = "sample") %>% 
+  mutate(value = value/nrow(cohort_III_proteomics)*100,
+         plex = stringr::str_extract(sample, "r\\d_\\d{3}$"),
+         sample = as.factor(sample)) %>% 
+  
+  ggplot(aes(x=fct_reorder(sample, plex), y = value, fill = plex)) +
+   geom_col()
+```
+
+```{r}
+cohort_III_proteomics[, stringr::str_detect(colnames(cohort_III_proteomics), "_297")]
+```
+
+_297 is all healthy controls which have even much higher rates of missing values (>35%)
+
+```{r}
+cohort_III_proteomics %>% 
+  column_to_rownames("gene_names") %>% 
+  as.matrix()  -> cohort_III_proteomics
+
+cohort_III_proteomics[is.nan(cohort_III_proteomics)] <- NA_integer_
+
+# we remove any protein that are missing in more than 30% of the samples
+
+matrixStats::rowSums2(is.na(cohort_III_proteomics)) > 0.5*ncol(cohort_III_proteomics) -> missing_vector
+
+cohort_III_proteomics[!missing_vector, ] -> cohort_III_proteomics
+```
+
+## prior to batch adjustment
+
+```{r}
+cohort_III_proteomics %>% 
+  as_tibble(rownames = "genes") %>% 
+  pivot_longer(cols = -genes, values_to = "int", names_to = "sample") %>% 
+  mutate(sample_id = stringr::str_remove(sample, "r\\d_")) %>% 
+  summarize(int = mean(int, na.rm = T), .by=c(sample_id, genes)) -> cohort_III_proteomics_uncorrected
+
+cohort_III_proteomics_uncorrected %>% 
+  mutate(plex = stringr::str_extract(sample_id,"_\\d{3}$")) %>% 
+  arrange(plex, sample_id) %>%
+  mutate(sample_id = factor(sample_id, levels=unique(sample_id))) %>% 
+  ggplot(aes(x=sample_id, y = log2(int), fill = plex)) + 
+  geom_boxplot(outlier.colour = NA) +
+  cowplot::theme_cowplot() 
+```
+
+
+## batch adjustment
+
+
+```{r}
+cohort_III_proteomics %>% 
+  as_tibble(rownames = "gene_names") %>% 
+  dplyr::select(gene_names, starts_with("10_")) %>% 
+  pivot_longer(cols = -gene_names) %>% 
+  ggplot(aes(x=as.factor(name), y = log2(value))) +
+  geom_boxplot()
+```
+
+I have tried multiple times to perform IRS but I fear that there's too much variation in the standards and the inter-plex correlation is too low
+
+```{r}
+cohort_III_proteomics[, stringr::str_detect(colnames(cohort_III_proteomics), "10_")] %>% 
+  cor(use = "pairwise.complete.obs") %>% 
+  corrplot::corrplot(addCoef.col = "black", type = "lower")
+```
+
+we thus remove the standards from the matrix
+
+```{r}
+cohort_III_proteomics[, !stringr::str_detect(colnames(cohort_III_proteomics), "10_")] -> cohort_III_proteomics
+```
+
+we remove additional features which are missing in >50% of samples
+
+We will use non-parametric ComBat correction within the harmonizR framework 
+
+```{r}
+
+batch_df <- 
+  tibble(sample_name = colnames(cohort_III_proteomics)) %>% 
+  mutate(ID = sample_name,
+         sample = 1:ncol(cohort_III_proteomics),
+         batch = as.factor(stringr::str_extract(sample_name, "_\\d{3}$"))) %>% 
+  dplyr::select(-sample_name)
+
+
+cohort_III_proteomics_corrected <- HarmonizR::harmonizR(data = cohort_III_proteomics, description_as_input = batch_df, algorithm = "ComBat", ComBat_mode = 3)
+
+cohort_III_proteomics_corrected %>% 
+  as_tibble(rownames = "gene_names") %>% 
+  pivot_longer(cols = -gene_names) %>% 
+  mutate(plex = stringr::str_extract(name, "_\\d{3}")) %>% 
+  ggplot(aes(x=as.factor(name), y = log2(value), fill = plex)) + 
+  geom_boxplot(outlier.colour = NA) +
+  ylim(c(10,20))
+```
+
+we then aggregate the replicates
+
+```{r}
+cohort_III_proteomics_corrected %>% 
+  as_tibble(rownames = "genes") %>% 
+  pivot_longer(cols = -genes) %>% 
+  mutate(sample_id = stringr::str_remove(name, "r\\d_")) %>% 
+  summarize(value = mean(value, na.rm = T), .by=c(genes, sample_id)) %>% 
+  pivot_wider(id_cols = genes, values_from = "value", names_from = "sample_id") %>% 
+  column_to_rownames("genes") %>% 
+  as.matrix() -> cohort_III_proteomics_aggr
+```
+
+
+```{r}
+cohort_III_proteomics_aggr %>% 
+  as_tibble(rownames = "gene_names") %>% 
+  pivot_longer(cols = -gene_names) %>% 
+  mutate(plex = stringr::str_extract(name, "_\\d{3}")) %>% 
+  ggplot(aes(x=as.factor(name) %>% fct_reorder(plex), y = log2(value), fill = plex)) + 
+  geom_boxplot(outlier.colour = NA) +
+  ylim(c(10,20)) +
+  cowplot::theme_cowplot()
+
+```
+
+we can do a quick assessment of the value of batch correction by comparing the number of genes with expression significantly correlated with batch
+
+```{r}
+# assess number of genes significantly associated with batch
+# and compare between corrected and uncorrected versions
+
+batch_df_lm <- tibble(sample = colnames(cohort_III_proteomics_aggr)) %>% 
+  mutate(plex = stringr::str_extract(sample, "_\\d{3}"),
+         plex = factor(plex))
+
+p_values <- apply(cohort_III_proteomics_aggr, 1, function(gene_expr) {
+  tryCatch({
+    lm_result <- lm(gene_expr ~ plex, data = batch_df_lm)
+  anova(lm_result)$'Pr(>F)'[1]} ,error = function(e) {
+    NA
+    })
+})
+
+sum(p_values < 0.05, na.rm = T)
+
+cohort_III_proteomics_uncorrected %>% 
+  pivot_wider(id_cols = genes, names_from = "sample_id", values_from = "int") %>% 
+  column_to_rownames("genes") %>% 
+  as.matrix() -> cohort_III_proteomics_uncorrected.mat
+
+p_values_uncorrected <- apply(cohort_III_proteomics_uncorrected.mat, 1, function(gene_expr) {
+  tryCatch({
+    lm_result <- lm(gene_expr ~ plex, data = batch_df_lm)
+  anova(lm_result)$'Pr(>F)'[1]} ,error = function(e) {
+    NA
+    })
+})
+
+sum(p_values_uncorrected < 0.5, na.rm = T)
+```
+which significantly decreased after combat
+
+and we can do variance decomposition using linear mixed models
+
+```{r}
+matrixStats::rowSums2(is.na(cohort_III_proteomics_aggr)) > 0.5*ncol(cohort_III_proteomics_aggr) -> missing_vec
+
+cohort_III_proteomics_aggr[!missing_vec, ] -> cohort_III_proteomics_aggr
+
+cohort_III_proteomics_uncorrected.mat %>% 
+  t() %>% 
+  pcaMethods::pca(nPcs = 10) %>% 
+  pcaMethods::scores() -> pca_scores_uncorrected
+
+
+library(lme4)
+
+decomp_df <- bind_cols(batch_df_lm, pca_scores_uncorrected)
+variance_results <- list()
+batch_variance_prop <- numeric(10)
+
+for(i in 1:10) {
+        # Fit linear mixed model
+        form <- as.formula(paste0("PC", i, " ~ (1|plex)"))
+        fit <- lmer(form, data = decomp_df)
+        
+        # Extract variance components
+        vc <- VarCorr(fit)
+        total_var <- sum(sapply(vc, function(x) x[1])) + sigma(fit)^2
+        batch_var <- vc$plex[1]
+        
+        # Calculate proportion of variance explained by batch
+        batch_variance_prop[i] <- batch_var / total_var
+        
+        variance_results[[i]] <- list(
+            total_variance = total_var,
+            batch_variance = batch_var,
+            residual_variance = sigma(fit)^2
+        )
+}
+```
+
+after combat, there's no retain variance explained by batch and we get singularity errors for the first 10 PCs
+
+## visualization and exploration
+
+```{r}
+cohort_III_proteomics_aggr %>% 
+  log2() -> cohort_III_prot
+
+cohort_III_prot[is.nan(cohort_III_prot)] <- NA_integer_
+
+cohort_III_prot %>% 
+  as_tibble(rownames = "genes") %>% 
+  pivot_longer(cols = -genes,names_to = "sample", values_to ="int") %>% 
+  ggplot(aes(x=factor(sample), y = int)) +
+  geom_boxplot(outlier.colour = NA) +
+  cowplot::theme_cowplot() +
+  ylim(c(10,20))
+```
+
+```{r}
+cohort_III_prot %>% 
+  t() %>% 
+  pcaMethods::pca() %>% 
+  pcaMethods::scores() %>% 
+  as_tibble(rownames = "sample") %>% 
+  left_join(mutate(cohort_III_metadata, id = paste(tmt_channel, id, sep = "_")), by=c("sample" = "id")) %>% 
+  mutate(plex = stringr::str_extract(sample, "_\\d{3}$")) %>% 
+  ggplot(aes(x=PC1, y = PC2, col = plex)) +
+  geom_point() + 
+  cowplot::theme_cowplot() -> plot1
+
+cohort_III_prot %>% 
+  t() %>% 
+  pcaMethods::pca() %>% 
+  pcaMethods::scores() %>% 
+  as_tibble(rownames = "sample") %>% 
+  left_join(mutate(cohort_III_metadata, id = paste(tmt_channel, id, sep = "_")), by=c("sample" = "id")) %>% 
+  mutate(plex = stringr::str_extract(sample, "_\\d{3}$")) %>% 
+  ggplot(aes(x=PC1, y = PC2, col = type)) +
+  geom_point() + 
+  cowplot::theme_cowplot() -> plot2
+
+cowplot::plot_grid(plot1, plot2)
+```
+

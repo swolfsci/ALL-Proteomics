@@ -1,0 +1,198 @@
+---
+title: "ALL proteogenomics - proteomics"
+author: "Sebastian Wolf"
+date: today
+lightbox: auto
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Table of Contents"
+    code-fold: true
+    code-tools: true
+    self-contained: true
+    html-math-method: katex
+    number-sections: true
+    number-depth: 3
+    theme: flatly
+---
+
+ALL proteomics data were measured in three independent runs from first diagnosis bone marrow samples of varying quality. In this first analysis, we need to harmonize the measurements and identify any technical variability that might need additional accounting for.
+
+```{r}
+library(tidyverse)
+library(HarmonizR)
+```
+
+We have previously created a sample overview also flagging any samples that were measured repeatedly that we can use.
+
+```{r}
+masterfile_ac_cohortI %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(bm_nr, lab_id, diagnosedatum, studie, mol_gen, subtyp) %>% 
+  mutate(studie = as.character(studie), cohort = "cohort_I") -> masterfile_ac_cohortI_mod
+
+masterfile_ac_cohortII %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(tube_ms, bm_nr, lab_id, mol_subtyp_kiel, studie, mol_gen, viability_percent, cd19) %>% 
+  mutate(bm_nr = as.numeric(bm_nr),
+         studie = as.character(studie),
+         cd19 = readr::parse_number(cd19), 
+         cohort = "cohort_II") -> masterfile_ac_cohortII_mod
+
+masterfile_ac_cohortIII %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(bm_nr, lab_id, mol_subtyp_kiel, studie, diagnosedatum, subtyp, mol_gen, viability_percent, cd19) %>% 
+  mutate(across(.cols = c(cd19, viability_percent), ~ . * 100),
+         cohort = "cohort_III") -> masterfile_ac_cohortIII_mod
+
+bind_rows(masterfile_ac_cohortI_mod, masterfile_ac_cohortII_mod, masterfile_ac_cohortIII_mod) -> masterfile_ac
+
+healty_donors <- tibble(bm_nr = c("703242202613", "70324221535", "70324302707", "70324161060", "70324221617", "70324302750", "70324302766", "703324202617"), cohort = "healty_donor") %>% 
+  mutate(bm_nr = as.numeric(bm_nr))
+
+bind_rows(masterfile_ac, healty_donors) -> masterfile_ac
+```
+
+There are 21 samples that are not found in the excel masterfile probably b/c they were removed due to low sample quality.
+
+There was an initial run of which we want to include 13 samples b/c they were of the best quality.
+
+```{r}
+library(SummarizedExperiment)
+
+# we first check which samples were measured in this run
+# ID corresponds to the bm_nr
+# we join the labIds to identify unique patients
+
+
+colData(all.summarizedExperiment) %>% 
+  as_tibble(rownames = "prot_id") %>% 
+  dplyr::rename(c("bm_nr" = "ID")) %>% 
+  mutate(across(.cols = c(viability, cd45_blasts, cd19_blasts), ~ .*100)) %>% 
+  filter(bm_nr %in% masterfile_ac$bm_nr) -> good_pilot_samples
+
+all.summarizedExperiment[,good_pilot_samples$prot_id] -> good_pilot_samples_summarizedExperiment
+
+cohort_I_proteomics <- assay(good_pilot_samples_summarizedExperiment)
+cohort_I_metadata <- colData(good_pilot_samples_summarizedExperiment)
+
+#features are currently identified with their uniprot ID which we will map to HGNC symbols
+rownames(cohort_I_proteomics) %>% 
+  biomaRt::getBM(values = ., filters = "uniprotswissprot", attributes = c("uniprotswissprot", "hgnc_symbol"), mart = biomaRt::useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", mirror = "www"), ) -> cohort_I_mappings
+
+left_join(tibble(uniprotid = rownames(cohort_I_proteomics)), cohort_I_mappings, by= c("uniprotid" = "uniprotswissprot")) %>% 
+  distinct(uniprotid, .keep_all = T) -> cohort_I_mappings
+
+cohort_I_proteomics %>% 
+  as_tibble(rownames = "uniprotswissprot") %>% 
+  bind_cols("gene_names" = cohort_I_mappings$hgnc_symbol) %>% 
+  filter(!is.na(gene_names)) %>% 
+  dplyr::select(-uniprotswissprot) %>% 
+  pivot_longer(cols = -gene_names, names_to= "sample", values_to = "int") %>% 
+  summarize(int = mean(int, na.rm =T), .by=c(sample, gene_names)) %>% 
+  pivot_wider(id_cols = gene_names, names_from = "sample", values_from = "int") %>% 
+  column_to_rownames("gene_names") %>% 
+  as.matrix() -> cohort_I_proteomics
+  
+cohort_I_proteomics[is.nan(cohort_I_proteomics)] <- NA_integer_
+```
+
+Next we'll investigate the cohort II samples which were preprocessed according to IRS and corrected for plex-batch
+
+```{r}
+cohort_II_proteomics <- all_cohort.fin.harmonizR.aggr
+
+sample_metadata %>% 
+  dplyr::rename(c("bm_nr" = "sample_name")) -> cohort_II_metadata
+
+masterfile_ac %>% 
+  filter(bm_nr %in% cohort_II_metadata$bm_nr)
+
+cohort_II_proteomics$gene_names <- stringr::str_extract(cohort_II_proteomics$gene_names, ".*?(?=(;|$))")
+
+cohort_II_proteomics %>% 
+  filter(!is.na(gene_names)) %>% 
+  pivot_longer(cols = -gene_names, names_to = "sample", values_to ="int") %>% 
+  summarize(int = mean(int, na.rm = T), .by=c(sample, gene_names)) %>% 
+  pivot_wider(id_cols = gene_names, names_from = "sample", values_from = "int") -> cohort_II_proteomics
+
+cohort_II_proteomics %>% 
+  column_to_rownames("gene_names") %>% 
+  as.matrix() -> cohort_II_proteomics.mat
+
+cohort_II_proteomics.mat[is.nan(cohort_II_proteomics.mat)] <- NA_integer_
+```
+
+And finally we have the cohort III proteomics which were processed using non-parametric ComBat to remove impact of plex.
+
+We first perform an naive join of all the cohorts using gene names
+
+```{r}
+cohort_I_proteomics %>% 
+  as_tibble(rownames = "gene_names") %>% 
+  dplyr::rename_with(.cols = -gene_names, ~ paste0("cohort1_",.)) -> cohort_I_proteomics.merge
+
+cohort_II_proteomics.mat %>% 
+  as_tibble(rownames ="gene_names") %>% 
+  dplyr::rename_with(.cols = -gene_names, ~ paste0("cohort2_",.)) -> cohort_II_proteomics.merge
+
+cohort_III_prot %>% 
+  as_tibble(rownames = "gene_names") %>% 
+  dplyr::rename_with(.cols = -gene_names, ~ paste0("cohort3_",.)) -> cohort_III_proteomics.merge
+```
+
+```{r}
+ggvenn::ggvenn(data = list("cohort1" = cohort_I_proteomics.merge$gene_names, 
+                           "cohort2" = cohort_II_proteomics.merge$gene_names, 
+                           "cohort3" = cohort_III_proteomics.merge$gene_names))
+```
+```{r}
+left_join(cohort_I_proteomics.merge, cohort_II_proteomics.merge, by=c("gene_names")) %>% 
+  left_join(cohort_III_proteomics.merge, by=c("gene_names")) -> all_proteomics_merge
+```
+
+```{r}
+all_proteomics_merge %>% 
+  column_to_rownames("gene_names") %>% 
+  as.matrix() -> all_proteomics_merge
+```
+
+```{r}
+all_proteomics_merge %>% 
+  t() %>% 
+  pcaMethods::pca() %>% 
+  pcaMethods::scores() %>% 
+  as_tibble(rownames = "sample") %>% 
+  mutate(cohort = stringr::str_extract(sample, "cohort\\d")) %>% 
+  ggplot(aes(PC1,PC2, col = cohort)) +
+  geom_point() +
+  cowplot::theme_cowplot()
+```
+
+```{r}
+batch_df <- tibble(ID = colnames(all_proteomics_merge)) %>% 
+  mutate(sample = 1:ncol(all_proteomics_merge), 
+         batch = factor(stringr::str_extract(ID, "cohort\\d")))
+
+all_proteomics_merge_corrected <- HarmonizR::harmonizR(data = all_proteomics_merge, description_as_input = batch_df, ComBat_mode = 3)
+```
+
+```{r}
+
+matrixStats::rowSums2(is.na(all_proteomics_merge_corrected)) > 0.5*ncol(all_proteomics_merge_corrected) -> missing_vec
+
+all_proteomics_merge_corrected_filtered <- all_proteomics_merge_corrected[!missing_vec, ]
+
+all_proteomics_merge_corrected_filtered %>% 
+  t() %>% 
+  pcaMethods::pca() %>% 
+  pcaMethods::scores() %>% 
+  as_tibble(rownames = "sample") %>% 
+  mutate(cohort = stringr::str_extract(sample, "cohort\\d")) %>% 
+  ggplot(aes(PC1,PC2, col = cohort)) +
+  geom_point() +
+  cowplot::theme_cowplot()
+```
+

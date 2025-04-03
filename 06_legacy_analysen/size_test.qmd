@@ -1,0 +1,31 @@
+---
+title: "size_test"
+toc: true
+format:
+  html:
+    theme: litera
+    self-contained: true
+    code-fold: true
+knitr:
+  opts_chunk:
+    message: false
+    warning: false
+bibliography: references.bib
+---
+
+## 
+
+```{r}
+#| fig-width: 13
+#| fig-height: 8
+
+
+meta.all$rnaseq_subtype <- prot.all.cog_subgroups.gsva.subtypes$subtype
+
+meta.all %>% 
+  dplyr::select(prot_id, class, rnaseq_subtype) %>% 
+  pivot_wider(id_cols = prot_id, names_from = rnaseq_subtype, values_from = rnaseq_subtype, values_fn = ~ ifelse(is.na(.), NA_integer_ ,1), values_fill = 0) %>% 
+  column_to_rownames("prot_id") %>% 
+  t() %>% 
+  ComplexHeatmap::Heatmap(column_split = meta.all$class, na_col = "white", col = circlize::colorRamp2(breaks = c(0,1), colors = c("lightgrey", "red")), show_row_dend = F, show_column_dend = F, rect_gp = grid::gpar(col = "white", lwd = 2), cluster_column_slices = F)
+```

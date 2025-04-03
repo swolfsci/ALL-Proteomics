@@ -11,3 +11,15 @@
 *.pdf
 *.html
 *.pptx
+*.png
+*.xlsx
+*.gif
+*.tsv
+*.RDS
+*.ico
+*.bib
+Data/
+Dokumente/
+js/
+*.csv
+.quarto
