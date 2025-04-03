@@ -148,4 +148,5 @@ median_to_pc1 <- function(data) {
 
 ```{r}
 all_proteomics_norm <- log2(all_proteomics_norm)
+all_proteomics_norm <- all_proteomics_norm[, !stringr::str_starts(colnames(all_proteomics_norm), "is"),]
 ```
