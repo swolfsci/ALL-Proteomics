@@ -282,14 +282,22 @@ all_proteomics_norm %>%
   mutate(rank = sign(logFC) * -log10(adj.P.Val)) -> kmt2a_de_proteins
 
 kmt2a_de_proteins %>% 
-  mutate(label = ifelse(-log10(adj.P.Val) > -log10(0.05) & abs(logFC) > 1, protein, NA_character_)) %>% 
-  ggplot(aes(logFC, -log10(adj.P.Val), label = label)) + 
-  geom_point(size = 2) +
-  geom_hline(yintercept = -log10(0.05)) + 
-  geom_vline(xintercept = c(-1,1)) +
-  cowplot::theme_cowplot() +
-  ggrepel::geom_text_repel() + 
-  ggtitle("DE proteins")
+  mutate(label = ifelse(-log10(adj.P.Val) > -log10(0.05) & abs(logFC) > 1, protein, NA_character_),
+         signature_gene = protein %in% b_all_signatures_list_gene_names[["KMT2A"]]) %>% 
+  {
+    ggplot(data = ., aes(logFC, -log10(adj.P.Val), label = label)) + 
+      geom_point(data = filter(., !signature_gene), size = 2, alpha = 0.4, col = "blue") +
+      geom_point(data = filter(., signature_gene), size = 2, alpha = 1, col = "red") + 
+      geom_hline(yintercept = -log10(0.05)) + 
+      geom_vline(xintercept = c(-1,1)) +
+      cowplot::theme_cowplot() +
+      ggrepel::geom_text_repel() + 
+      ggtitle("DE proteins")}
+
+kmt2a_de_proteins %>% 
+  inner_join(kmt2a_signature, by=c("protein" = "geneName")) %>% 
+  ggplot(aes(logFC, log2FoldChange)) + 
+  geom_point()
 ```
 
 ```{r}
@@ -297,15 +305,16 @@ allcatchr_pred %>%
   filter(Prediction == "KMT2A") %>% 
   pull(sample) -> kmt2a_samples
 
+rna_counts_cpm_coding_allonly <- rna_counts_cpm_coding[, !stringr::str_starts(colnames(rna_counts_cpm_coding), "d")]
 
-tibble(sample = colnames(rna_counts_cpm_coding)) %>% 
+tibble(sample = colnames(rna_counts_cpm_coding_allonly)) %>% 
   mutate(kmt2a = sample %in% kmt2a_samples) -> kmt2a_vector
 
 mm <- model.matrix(~ 0 + kmt2a, data = kmt2a_vector)
 colnames(mm) <- c("other", "kmt2a")
 cm <- makeContrasts(kmt2a - other, levels = mm)
 
-rna_counts_cpm_coding %>% 
+rna_counts_cpm_coding_allonly %>% 
   limma::lmFit(mm) %>% 
   limma::contrasts.fit(cm) %>% 
   limma::eBayes() %>% 
@@ -314,14 +323,22 @@ rna_counts_cpm_coding %>%
   mutate(rank = sign(logFC) * -log10(adj.P.Val)) -> kmt2a_de_genes
 
 kmt2a_de_genes %>% 
-  mutate(label = ifelse(-log10(adj.P.Val) > -log10(0.05) & abs(logFC) > 1, gene, NA_character_)) %>% 
-  ggplot(aes(logFC, -log10(adj.P.Val), label = label)) + 
-  geom_point(size = 2) +
-  geom_hline(yintercept = -log10(0.05)) + 
-  geom_vline(xintercept = c(-1,1)) +
-  cowplot::theme_cowplot() +
-  ggrepel::geom_text_repel() + 
-  ggtitle("DE genes")
+  mutate(label = ifelse(-log10(adj.P.Val) > -log10(0.05) & abs(logFC) > 1, gene, NA_character_),
+         signature_gene = gene %in% b_all_signatures_list_gene_names[["KMT2A"]]) %>% 
+  {
+    ggplot(data = ., aes(logFC, -log10(adj.P.Val), label = label)) + 
+      geom_point(data = filter(., !signature_gene), size = 2, alpha = 0.4, col = "blue") +
+      geom_point(data = filter(., signature_gene), size = 2, alpha = 1, col = "red") + 
+      geom_hline(yintercept = -log10(0.05)) + 
+      geom_vline(xintercept = c(-1,1)) +
+      cowplot::theme_cowplot() +
+      ggrepel::geom_text_repel() + 
+      ggtitle("DE genes")}
+
+kmt2a_de_genes %>% 
+  inner_join(kmt2a_signature, by=c("gene" = "geneName")) %>% 
+  ggplot(aes(logFC, log2FoldChange)) + 
+  geom_point()
 ```
 
 ```{r}
@@ -401,4 +418,29 @@ kmt2a_de_proteins.gsego %>%
   filter(ONTOLOGY== "MF" & NES > 0) %>% 
   enrichplot::dotplot(showCategory = 15) +
   ggtitle("MF up in KMT2A")
+```
+
+### Factor 3 - Ph/PAX5 factor
+
+```{r}
+plot_factor(mofa_trained, factor = 3, color_by = "Prediction")
+plot_factors(mofa_trained, factor = c(2,3), color_by = "Prediction")
+```
+
+```{r}
+plot_enrichment(mofa_enrichment_parametric_proteomics_up$immunesigdb, factor = 3)
+```
+
+### Factor 4
+
+Factor 4 is mainly driven by the proteome
+
+```{r}
+plot_factor(mofa_trained, factors = 4, color_by = "ont")
+plot_factors(mofa_trained, factors=c(3,4), color_by="Prediction")
+```
+
+```{r}
+plot_enrichment_heatmap(mofa_enrichment_parametric_proteomics_up$h)
+plot_enrichment_detailed(mofa_enrichment_parametric_proteomics_up$signature_db, factor = 4)
 ```

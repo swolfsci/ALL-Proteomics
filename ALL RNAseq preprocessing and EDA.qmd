@@ -126,3 +126,44 @@ rna_counts_cpm %>%
 
 #ggsave(rna_pca_plot, filename = "rna_pca_plot.pdf", device = "pdf", width = 1.7*6, height = 6)
 ```
+
+## B-ALL gene expression signatures enrichment
+
+```{r}
+# while we already have the molecular predictions from ALLCatchR, we will perform a quick cross validation using GSVA and the B-ALL gene expression signatures
+
+library(GSVA)
+
+b_all_signatures <- readxl::excel_sheets("Data/COG RNASeq/B-ALL-subtype-signature.xlsx")
+
+b_all_signatures <- b_all_signatures[!b_all_signatures %in% c("Cohort", "summary")]
+
+imap(b_all_signatures, ~ readxl::read_excel("Data/COG RNASeq/B-ALL-subtype-signature.xlsx", sheet = .x) %>% 
+       filter(log2FoldChange > 0 & padj <= 0.05) %>% 
+       pull(geneID)) %>% 
+  magrittr::set_names(b_all_signatures) -> b_all_signatures_list
+
+imap(b_all_signatures, ~ readxl::read_excel("Data/COG RNASeq/B-ALL-subtype-signature.xlsx", sheet = .x) %>% 
+       filter(log2FoldChange > 0 & padj <= 0.05) %>% 
+       pull(geneName)) %>% 
+  magrittr::set_names(b_all_signatures) -> b_all_signatures_list_gene_names
+
+kmt2a_signature <- readxl::read_excel("Data/COG RNASeq/B-ALL-subtype-signature.xlsx", sheet = "KMT2A")
+
+gsva(gsvaParam(exprData = rna_counts_cpm, geneSets = b_all_signatures_list, kcdf = "Gaussian")) -> rna_counts_gsva_b_all_signatures
+
+tibble("sample" = colnames(rna_counts_gsva_b_all_signatures)) %>% 
+  left_join(allcatchr_pred, by="sample") %>% 
+  dplyr::select(-sample) %>% 
+  ComplexHeatmap::HeatmapAnnotation(df = .) -> heatmap_anno
+
+ComplexHeatmap::Heatmap(rna_counts_gsva_b_all_signatures, top_annotation = heatmap_anno)
+
+rna_counts_gsva_b_all_signatures %>% 
+  as_tibble(rownames = "signature") %>% 
+  pivot_longer(cols = -signature, names_to = "sample", values_to = "score") %>% 
+  group_by(sample) %>% 
+  arrange(desc(score), .by_group = T) %>% 
+  slice_head(n = 1) %>% 
+  left_join(allcatchr_pred, by="sample") 
+```
